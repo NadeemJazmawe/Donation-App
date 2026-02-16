@@ -1,0 +1,16 @@
+{
+  "name": "db-migration",
+  "version": "1.0.0",
+  "description": "Database migration scripts for donation app",
+  "main": "migrate.js",
+  "scripts": {
+    "migrate": "node migrate.js",
+    "seed": "node seed.js",
+    "reset": "node reset.js",
+    "add-activity-status": "node add-activity-status.js"
+  },
+  "dependencies": {
+    "mongoose": "^8.0.3",
+    "dotenv": "^16.3.1"
+  }
+}

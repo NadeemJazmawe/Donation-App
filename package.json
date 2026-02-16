@@ -1,0 +1,26 @@
+{
+  "name": "donation-app",
+  "version": "1.0.0",
+  "description": "People management application with React Native Web and MongoDB",
+  "main": "index.js",
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd backend && node server.js",
+    "client": "cd frontend && npm start",
+    "install-all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "db:migrate": "cd db-migration && node migrate.js",
+    "db:seed": "cd db-migration && node seed.js",
+    "db:reset": "cd db-migration && node reset.js",
+    "db:add-activity-status": "cd db-migration && node add-activity-status.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

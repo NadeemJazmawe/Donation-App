@@ -1,0 +1,19 @@
+{
+  "name": "donation-app-backend",
+  "version": "1.0.0",
+  "description": "Backend server for donation app",
+  "main": "server.js",
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^8.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  }
+}
