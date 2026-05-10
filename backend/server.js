@@ -3,6 +3,8 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
 
+require('./models/Season');
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -21,6 +23,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/donation-
 
 // Routes
 app.use('/api/persons', require('./routes/persons'));
+app.use('/api/seasons', require('./routes/seasons'));
 
 // Health check
 app.get('/api/health', (req, res) => {

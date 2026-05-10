@@ -1,9 +1,76 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Modal, TextInput, Switch } from 'react-native';
 import { translations } from './translations';
-import * as XLSX from 'xlsx';
+import * as XLSX from 'xlsx-js-style';
+
+const EXCEL_FONT_SIZE = 16;
+const EXCEL_COL_NARROW_WCH = 10; // row number column only
+const EXCEL_COL_WIDE_WCH = 48;
+
+// RTL workbook view (Excel shows sheet right-to-left; col A on the right — matches Arabic layout)
+const applyWorkbookRtl = (workbook) => {
+  if (!workbook) return;
+  workbook.Workbook = workbook.Workbook || {};
+  workbook.Workbook.Views = [{ RTL: true }];
+};
+
+/**
+ * Column widths: narrow only for listed indexes (e.g. row-no column); wide for all others.
+ * Cells: large font, vertical center, horizontal right + RTL reading order (numbers column centered).
+ */
+const finalizeExcelWorksheet = (worksheet, options = {}) => {
+  const { narrowColumnIndexes = [] } = options;
+  if (!worksheet || !worksheet['!ref']) return;
+  const range = XLSX.utils.decode_range(worksheet['!ref']);
+  const numCols = range.e.c - range.s.c + 1;
+
+  worksheet['!cols'] = [];
+  for (let c = 0; c < numCols; c++) {
+    const narrow = narrowColumnIndexes.includes(c);
+    worksheet['!cols'][c] = { wch: narrow ? EXCEL_COL_NARROW_WCH : EXCEL_COL_WIDE_WCH };
+  }
+
+  for (let R = range.s.r; R <= range.e.r; ++R) {
+    for (let C = range.s.c; C <= range.e.c; ++C) {
+      const addr = XLSX.utils.encode_cell({ r: R, c: C });
+      const cell = worksheet[addr];
+      if (!cell) continue;
+      const narrow = narrowColumnIndexes.includes(C);
+      cell.s = {
+        font: { sz: EXCEL_FONT_SIZE },
+        alignment: {
+          horizontal: narrow ? 'center' : 'right',
+          vertical: 'center',
+          wrapText: true,
+          readingOrder: 2
+        }
+      };
+    }
+  }
+};
 
 const API_URL = 'http://localhost:5000/api/persons';
+const SEASONS_API = 'http://localhost:5000/api/seasons';
+
+// Strip populated season subdocs for API save
+const preparePersonBody = (person) => {
+  if (!person) return {};
+  const { activities, ...rest } = person;
+  return {
+    ...rest,
+    activities: (activities || []).map((a) => ({
+      description: a.description,
+      date: a.date,
+      status: a.status || 'pending',
+      distributor: a.distributor != null ? String(a.distributor) : '',
+      season: (() => {
+        if (!a.season) return null;
+        if (typeof a.season === 'object' && a.season._id) return a.season._id;
+        return a.season;
+      })()
+    }))
+  };
+};
 
 // Helper function to calculate age
 const calculateAge = (birthday) => {
@@ -28,6 +95,36 @@ const formatDateForInput = (dateString) => {
   return `${year}-${month}-${day}`;
 };
 
+// Parse kid birthday into day, month, year for the three input boxes
+const getBirthdayParts = (kid) => {
+  if (!kid || !kid.birthday) return { day: '', month: '', year: '' };
+  const date = new Date(kid.birthday);
+  if (isNaN(date.getTime())) return { day: '', month: '', year: '' };
+  return {
+    day: String(date.getDate()),
+    month: String(date.getMonth() + 1),
+    year: String(date.getFullYear())
+  };
+};
+
+// Build YYYY-MM-DD from day, month, year strings; return '' if invalid or incomplete
+const buildBirthdayFromParts = (day, month, year) => {
+  const d = day.trim();
+  const m = month.trim();
+  const y = year.trim();
+  if (!d || !m || !y) return '';
+  const dayNum = parseInt(d, 10);
+  const monthNum = parseInt(m, 10);
+  const yearNum = parseInt(y, 10);
+  if (isNaN(dayNum) || isNaN(monthNum) || isNaN(yearNum)) return '';
+  if (monthNum < 1 || monthNum > 12) return '';
+  if (dayNum < 1 || dayNum > 31) return '';
+  if (yearNum < 1900 || yearNum > 2100) return '';
+  const monthStr = String(monthNum).padStart(2, '0');
+  const dayStr = String(dayNum).padStart(2, '0');
+  return `${yearNum}-${monthStr}-${dayStr}`;
+};
+
 const App = () => {
   const [language, setLanguage] = useState('ar'); // 'en' or 'ar'
   const t = translations[language];
@@ -47,8 +144,15 @@ const App = () => {
   const [filteredPersons, setFilteredPersons] = useState([]);
   const [openActivitiesFilters, setOpenActivitiesFilters] = useState({
     distributor: '',
+    season: '', // '' = all, '__NO_SEASON__', or season _id string
     activityStatus: 'open', // 'all', 'open', 'closed'
-    activityName: ''
+    activityName: '',
+    dateFromDay: '',
+    dateFromMonth: '',
+    dateFromYear: '',
+    dateToDay: '',
+    dateToMonth: '',
+    dateToYear: ''
   });
   const [showOpenActivitiesFilters, setShowOpenActivitiesFilters] = useState(false);
   const [paginatedPersons, setPaginatedPersons] = useState([]);
@@ -71,8 +175,20 @@ const App = () => {
   const [editingPerson, setEditingPerson] = useState(null);
   const [selectedPersonForActivities, setSelectedPersonForActivities] = useState(null);
   const [selectedPersonsForActivities, setSelectedPersonsForActivities] = useState([]); // Track selected persons for bulk activity addition
+  const [bulkAddActivityModalVisible, setBulkAddActivityModalVisible] = useState(false);
+  const [bulkAddActivityDescription, setBulkAddActivityDescription] = useState('');
+  const [bulkAddActivityDistributor, setBulkAddActivityDistributor] = useState(''); // distributor name or ''
+  const [bulkAddDistributorDropdownOpen, setBulkAddDistributorDropdownOpen] = useState(false);
+  const [bulkAddActivitySeasonId, setBulkAddActivitySeasonId] = useState('');
+  const [bulkAddSeasonDropdownOpen, setBulkAddSeasonDropdownOpen] = useState(false);
+  const [seasons, setSeasons] = useState([]);
+  const [seasonModalVisible, setSeasonModalVisible] = useState(false);
+  const [newSeasonName, setNewSeasonName] = useState('');
+  const [newActivitySeasonId, setNewActivitySeasonId] = useState('');
+  const [activitySeasonDropdownOpen, setActivitySeasonDropdownOpen] = useState(false);
   const [expandedKids, setExpandedKids] = useState({}); // Track which persons have kids expanded
   const [newActivity, setNewActivity] = useState('');
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
   const [formData, setFormData] = useState({
     name: '',
     phone: '',
@@ -81,19 +197,31 @@ const App = () => {
     maritalStatus: 'Single',
     liveInRenta: false,
     hasCar: false,
-    bankNumber: ''
+    bankNumber: '',
+    description: ''
   });
 
   useEffect(() => {
     fetchPersons();
+    fetchSeasons();
   }, []);
+
+  const fetchSeasons = async () => {
+    try {
+      const response = await fetch(SEASONS_API);
+      const data = await response.json();
+      setSeasons(Array.isArray(data) ? data : []);
+    } catch (error) {
+      console.error('Error fetching seasons:', error);
+    }
+  };
 
   // Save distributors to localStorage whenever they change
   useEffect(() => {
     localStorage.setItem('distributors', JSON.stringify(distributors));
   }, [distributors]);
 
-  // Filter persons based on search query and filters
+  // Filter persons based on search query, filters, and favorites
   useEffect(() => {
     let filtered = [...persons];
 
@@ -161,9 +289,14 @@ const App = () => {
       }
     }
 
+    // Favorites filter
+    if (showFavoritesOnly) {
+      filtered = filtered.filter(person => person.favorite);
+    }
+
     setFilteredPersons(filtered);
     setCurrentPage(1); // Reset to first page when filters change
-  }, [searchQuery, filters, persons]);
+  }, [searchQuery, filters, persons, showFavoritesOnly]);
 
   // Pagination logic
   useEffect(() => {
@@ -217,13 +350,19 @@ const App = () => {
     persons.forEach(person => {
       if (person.activities && person.activities.length > 0) {
         person.activities.forEach((activity, activityIndex) => {
+          const seasonObj = activity.season && typeof activity.season === 'object' ? activity.season : null;
+          const seasonId = seasonObj?._id || activity.season || null;
+          const seasonName = seasonObj?.name || null;
           peopleActivities.push({
             ...activity,
             personId: person._id,
             personName: person.name,
+            personPhone: person.phone || '',
             personKidsNumber: person.kidsNumber || 0,
             activityIndex: activityIndex,
-            activityStatus: activity.status || 'pending'
+            activityStatus: activity.status || 'pending',
+            seasonId,
+            seasonName
           });
         });
       } else {
@@ -231,11 +370,14 @@ const App = () => {
         peopleActivities.push({
           personId: person._id,
           personName: person.name,
+          personPhone: person.phone || '',
           personKidsNumber: person.kidsNumber || 0,
           description: '',
           distributor: '',
           activityStatus: 'none',
-          date: person.createdAt || new Date().toISOString()
+          date: person.createdAt || new Date().toISOString(),
+          seasonId: null,
+          seasonName: null
         });
       }
     });
@@ -282,31 +424,122 @@ const App = () => {
       );
     }
 
+    // Filter by season
+    if (openActivitiesFilters.season) {
+      if (openActivitiesFilters.season === '__NO_SEASON__') {
+        activities = activities.filter(activity =>
+          activity.description && !activity.seasonId
+        );
+      } else {
+        const sid = openActivitiesFilters.season;
+        activities = activities.filter(activity =>
+          activity.seasonId && String(activity.seasonId) === String(sid)
+        );
+      }
+    }
+
+    // Timeline: activity date between from/to (day/month/year), inclusive — same rules as kid birthday fields
+    const df = buildBirthdayFromParts(
+      openActivitiesFilters.dateFromDay || '',
+      openActivitiesFilters.dateFromMonth || '',
+      openActivitiesFilters.dateFromYear || ''
+    );
+    const dt = buildBirthdayFromParts(
+      openActivitiesFilters.dateToDay || '',
+      openActivitiesFilters.dateToMonth || '',
+      openActivitiesFilters.dateToYear || ''
+    );
+    if (df || dt) {
+      let fromTs = null;
+      let toTs = null;
+      if (df) {
+        const [y, m, d] = df.split('-').map(Number);
+        fromTs = new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+      }
+      if (dt) {
+        const [y, m, d] = dt.split('-').map(Number);
+        toTs = new Date(y, m - 1, d, 23, 59, 59, 999).getTime();
+      }
+      activities = activities.filter((activity) => {
+        const t = new Date(activity.date).getTime();
+        if (Number.isNaN(t)) return false;
+        if (fromTs !== null && t < fromTs) return false;
+        if (toTs !== null && t > toTs) return false;
+        return true;
+      });
+    }
+
     return activities;
   };
 
-  // Export filtered activities to Excel
+  const groupActivitiesBySeason = (activities) => {
+    const groups = [];
+    const indexByKey = {};
+    activities.forEach((activity) => {
+      const key = activity.seasonId ? String(activity.seasonId) : '__none__';
+      if (indexByKey[key] === undefined) {
+        indexByKey[key] = groups.length;
+        groups.push({
+          key,
+          title: activity.seasonName || t.uncategorizedSeason,
+          activities: []
+        });
+      }
+      groups[indexByKey[key]].activities.push(activity);
+    });
+    return groups;
+  };
+
+  // Export filtered activities to Excel (No., Name, Kids number, Activity, Distributor only)
   const exportToExcel = () => {
     const filteredActivities = getFilteredActivities();
-    
-    // Prepare data for Excel
-    const excelData = filteredActivities.map(activity => ({
+
+    const excelData = filteredActivities.map((activity, index) => ({
+      [t.rowNo]: index + 1,
       [t.name]: activity.personName,
       [t.kids]: activity.personKidsNumber,
+      [t.season]: activity.seasonName || t.uncategorizedSeason,
       [t.activity]: activity.description || '-',
-      [t.distributor]: activity.distributor || '-',
-      [t.status]: activity.activityStatus === 'pending' || !activity.activityStatus ? t.pending : 
-                  activity.activityStatus === 'completed' ? t.completed : '-',
-      [t.date]: activity.date ? new Date(activity.date).toLocaleString() : '-'
+      [t.distributor]: activity.distributor || '-'
     }));
 
-    // Create workbook and worksheet
     const worksheet = XLSX.utils.json_to_sheet(excelData);
+    finalizeExcelWorksheet(worksheet, { narrowColumnIndexes: [0] });
     const workbook = XLSX.utils.book_new();
+    applyWorkbookRtl(workbook);
     XLSX.utils.book_append_sheet(workbook, worksheet, t.openActivities);
 
-    // Generate Excel file
     const fileName = `Open_Activities_${new Date().toISOString().split('T')[0]}.xlsx`;
+    XLSX.writeFile(workbook, fileName);
+  };
+
+  // Selected rows on Open Activities page: same columns as exportToExcel, only checked people, still respecting filters
+  const exportSelectedOpenActivitiesToExcel = () => {
+    if (selectedPersonsForActivities.length === 0) return;
+    const selectedSet = new Set(selectedPersonsForActivities.map(id => String(id)));
+    const filteredActivities = getFilteredActivities().filter(a =>
+      a.personId && selectedSet.has(String(a.personId))
+    );
+    if (filteredActivities.length === 0) {
+      alert(t.noActivitiesFound);
+      return;
+    }
+
+    const excelData = filteredActivities.map((activity, index) => ({
+      [t.rowNo]: index + 1,
+      [t.name]: activity.personName,
+      [t.kids]: activity.personKidsNumber,
+      [t.season]: activity.seasonName || t.uncategorizedSeason,
+      [t.activity]: activity.description || '-',
+      [t.distributor]: activity.distributor || '-'
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(excelData);
+    finalizeExcelWorksheet(worksheet, { narrowColumnIndexes: [0] });
+    const workbook = XLSX.utils.book_new();
+    applyWorkbookRtl(workbook);
+    XLSX.utils.book_append_sheet(workbook, worksheet, t.openActivities);
+    const fileName = `Selected_Open_Activities_${new Date().toISOString().split('T')[0]}.xlsx`;
     XLSX.writeFile(workbook, fileName);
   };
 
@@ -343,10 +576,10 @@ const App = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(preparePersonBody({
           ...person,
           activities: updatedActivities
-        }),
+        })),
       });
 
       if (response.ok) {
@@ -381,10 +614,10 @@ const App = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(preparePersonBody({
           ...person,
           activities: updatedActivities
-        }),
+        })),
       });
 
       if (response.ok) {
@@ -398,6 +631,43 @@ const App = () => {
     }
   };
 
+  const updateActivitySeason = async (personId, activityIndex, seasonIdOrNull) => {
+    try {
+      const person = persons.find(p => p._id === personId);
+      if (!person) return;
+
+      const updatedActivities = person.activities.map((activity, index) => {
+        if (index === activityIndex) {
+          return {
+            ...activity,
+            season: seasonIdOrNull || null
+          };
+        }
+        return activity;
+      });
+
+      const response = await fetch(`${API_URL}/${personId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(preparePersonBody({
+          ...person,
+          activities: updatedActivities
+        })),
+      });
+
+      if (response.ok) {
+        fetchPersons();
+      } else {
+        alert(t.errorUpdatingSeason || t.errorUpdatingActivity);
+      }
+    } catch (error) {
+      console.error('Error updating activity season:', error);
+      alert(t.errorUpdatingSeason || t.errorUpdatingActivity);
+    }
+  };
+
   const handleAdd = () => {
     setEditingPerson(null);
     setFormData({
@@ -406,9 +676,10 @@ const App = () => {
       kids: [],
       monthIncome: '',
       maritalStatus: 'Single',
-      liveInRenta: false,
-      hasCar: false,
-      bankNumber: ''
+      liveInRenta: null,
+      hasCar: null,
+      bankNumber: '',
+      description: ''
     });
     setModalVisible(true);
   };
@@ -424,11 +695,12 @@ const App = () => {
             birthday: kid.birthday ? formatDateForInput(kid.birthday) : ''
           }))
         : [],
-      monthIncome: person.monthIncome.toString(),
+      monthIncome: person.monthIncome != null && person.monthIncome !== '' ? person.monthIncome.toString() : '',
       maritalStatus: person.maritalStatus,
-      liveInRenta: person.liveInRenta,
-      hasCar: person.hasCar,
-      bankNumber: person.bankNumber
+      liveInRenta: person.liveInRenta !== undefined && person.liveInRenta !== null ? person.liveInRenta : null,
+      hasCar: person.hasCar !== undefined && person.hasCar !== null ? person.hasCar : null,
+      bankNumber: person.bankNumber || '',
+      description: person.description || ''
     });
     setModalVisible(true);
   };
@@ -447,11 +719,12 @@ const App = () => {
         name: formData.name,
         phone: formData.phone,
         kids: validKids,
-        monthIncome: parseFloat(formData.monthIncome) || 0,
+        monthIncome: formData.monthIncome.trim() === '' ? null : (parseFloat(formData.monthIncome) || 0),
         maritalStatus: formData.maritalStatus,
-        liveInRenta: formData.liveInRenta,
-        hasCar: formData.hasCar,
-        bankNumber: formData.bankNumber
+        liveInRenta: formData.liveInRenta === null || formData.liveInRenta === undefined ? null : !!formData.liveInRenta,
+        hasCar: formData.hasCar === null || formData.hasCar === undefined ? null : !!formData.hasCar,
+        bankNumber: (formData.bankNumber || '').trim(),
+        description: (formData.description || '').trim() || null
       };
 
       const url = editingPerson ? `${API_URL}/${editingPerson._id}` : API_URL;
@@ -470,7 +743,10 @@ const App = () => {
         fetchPersons();
       } else {
         const error = await response.json();
-        alert('Error: ' + (error.message || 'Failed to save'));
+        const message = (response.status === 409 && error.message === 'DUPLICATE_PERSON')
+          ? (t.duplicatePerson || 'A person with this name and phone already exists.')
+          : (error.message || error.description || 'Failed to save');
+        alert('Error: ' + message);
       }
     } catch (error) {
       console.error('Error saving person:', error);
@@ -505,6 +781,34 @@ const App = () => {
     });
   };
 
+  // Update one part of kid's birthday (day, month, year) and rebuild full birthday.
+  // Always persist all three parts (day, month, year) so clearing one part doesn't clear the others.
+  const updateKidBirthdayPart = (index, part, value) => {
+    const kid = formData.kids[index];
+    const parts = getBirthdayParts(kid);
+    const day = part === 'day' ? value : (kid.birthdayDay !== undefined ? kid.birthdayDay : parts.day);
+    const month = part === 'month' ? value : (kid.birthdayMonth !== undefined ? kid.birthdayMonth : parts.month);
+    const year = part === 'year' ? value : (kid.birthdayYear !== undefined ? kid.birthdayYear : parts.year);
+    const newBirthday = buildBirthdayFromParts(day, month, year);
+    const newKids = [...formData.kids];
+    newKids[index] = {
+      ...kid,
+      birthdayDay: day,
+      birthdayMonth: month,
+      birthdayYear: year,
+      birthday: newBirthday
+    };
+    setFormData({ ...formData, kids: newKids });
+  };
+
+  // Display value for one birthday part (raw input or parsed from birthday)
+  const getKidBirthdayPart = (kid, part) => {
+    const raw = part === 'day' ? kid.birthdayDay : part === 'month' ? kid.birthdayMonth : kid.birthdayYear;
+    if (raw !== undefined && raw !== '') return raw;
+    const parts = getBirthdayParts(kid);
+    return parts[part];
+  };
+
   // Toggle kids visibility for a person
   const toggleKidsVisibility = (personId) => {
     setExpandedKids(prev => ({
@@ -517,6 +821,8 @@ const App = () => {
   const openActivitiesModal = (person) => {
     setSelectedPersonForActivities(person);
     setNewActivity('');
+    setNewActivitySeasonId(seasons[0]?._id || '');
+    setActivitySeasonDropdownOpen(false);
     setActivitiesModalVisible(true);
   };
 
@@ -525,11 +831,20 @@ const App = () => {
     setActivitiesModalVisible(false);
     setSelectedPersonForActivities(null);
     setNewActivity('');
+    setActivitySeasonDropdownOpen(false);
   };
 
   // Add new activity
   const addActivity = async () => {
     if (!newActivity.trim() || !selectedPersonForActivities) return;
+    if (seasons.length === 0) {
+      alert(t.addSeasonFirst);
+      return;
+    }
+    if (!newActivitySeasonId) {
+      alert(t.selectSeason);
+      return;
+    }
 
     try {
       const updatedActivities = [
@@ -537,7 +852,9 @@ const App = () => {
         {
           description: newActivity.trim(),
           date: new Date().toISOString(),
-          status: 'pending'
+          status: 'pending',
+          distributor: '',
+          season: newActivitySeasonId
         }
       ];
 
@@ -546,10 +863,10 @@ const App = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(preparePersonBody({
           ...selectedPersonForActivities,
           activities: updatedActivities
-        }),
+        })),
       });
 
       if (response.ok) {
@@ -567,10 +884,18 @@ const App = () => {
     }
   };
 
-  // Add activity to selected persons
-  const addActivityToSelected = async (activityDescription) => {
+  // Add activity to selected persons (with optional distributor)
+  const addActivityToSelected = async (activityDescription, distributorName = '', seasonId = '') => {
     if (!activityDescription.trim() || selectedPersonsForActivities.length === 0) {
       alert(t.selectPeopleFirst || 'Please select at least one person first');
+      return;
+    }
+    if (seasons.length === 0) {
+      alert(t.addSeasonFirst);
+      return;
+    }
+    if (!seasonId) {
+      alert(t.selectSeason);
       return;
     }
 
@@ -584,7 +909,9 @@ const App = () => {
           {
             description: activityDescription.trim(),
             date: new Date().toISOString(),
-            status: 'pending'
+            status: 'pending',
+            distributor: distributorName || '',
+            season: seasonId
           }
         ];
 
@@ -593,10 +920,10 @@ const App = () => {
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
+          body: JSON.stringify(preparePersonBody({
             ...person,
             activities: updatedActivities
-          }),
+          })),
         });
 
         if (!response.ok) {
@@ -606,12 +933,44 @@ const App = () => {
 
       await Promise.all(promises);
       setSelectedPersonsForActivities([]);
+      setBulkAddActivityModalVisible(false);
+      setBulkAddActivityDescription('');
+      setBulkAddActivityDistributor('');
+      setBulkAddActivitySeasonId(seasons[0]?._id || '');
+      setBulkAddSeasonDropdownOpen(false);
       fetchPersons(); // Refresh the list
       alert(t.activityAddedToSelected || `Activity added to ${selectedPersonsForActivities.length} person(s)`);
     } catch (error) {
       console.error('Error adding activity to selected persons:', error);
       alert(t.errorAddingActivity);
     }
+  };
+
+  // Export selected persons to Excel (main page)
+  const exportSelectedPersonsToExcel = () => {
+    if (selectedPersonsForActivities.length === 0) return;
+    const selectedPersons = persons.filter(p => selectedPersonsForActivities.includes(p._id));
+    if (selectedPersons.length === 0) return;
+
+    const excelData = selectedPersons.map(person => ({
+      [t.name]: person.name || '',
+      [t.phone]: person.phone || '',
+      [t.kids]: person.kidsNumber ?? (person.kids?.length ?? 0),
+      [t.income]: person.monthIncome != null && person.monthIncome !== '' ? person.monthIncome : '',
+      [t.status]: t[person.maritalStatus?.toLowerCase()] || person.maritalStatus || '',
+      [t.renta]: person.liveInRenta === true ? t.yes : person.liveInRenta === false ? t.no : (t.noAvailableData || 'No available data'),
+      [t.car]: person.hasCar === true ? t.yes : person.hasCar === false ? t.no : (t.noAvailableData || 'No available data'),
+      [t.bank]: person.bankNumber || '',
+      [t.description]: person.description || ''
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(excelData);
+    finalizeExcelWorksheet(worksheet, { narrowColumnIndexes: [] });
+    const workbook = XLSX.utils.book_new();
+    applyWorkbookRtl(workbook);
+    XLSX.utils.book_append_sheet(workbook, worksheet, t.peopleManagement || 'People');
+    const fileName = `Selected_Persons_${new Date().toISOString().split('T')[0]}.xlsx`;
+    XLSX.writeFile(workbook, fileName);
   };
 
   // Toggle activity status
@@ -660,10 +1019,10 @@ const App = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(preparePersonBody({
           ...selectedPersonForActivities,
           activities: updatedActivities
-        }),
+        })),
       });
 
       if (response.ok) {
@@ -705,10 +1064,10 @@ const App = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(preparePersonBody({
           ...selectedPersonForActivities,
           activities: updatedActivities
-        }),
+        })),
       });
 
       if (response.ok) {
@@ -744,15 +1103,272 @@ const App = () => {
     }
   };
 
+  const toggleFavorite = async (personId) => {
+    try {
+      const person = persons.find(p => p._id === personId);
+      if (!person) return;
+
+      const updatedPerson = { ...person, favorite: !person.favorite };
+
+      const response = await fetch(`${API_URL}/${personId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(preparePersonBody(updatedPerson)),
+      });
+
+      if (response.ok) {
+        const saved = await response.json();
+        setPersons(prev =>
+          prev.map(p => (p._id === personId ? saved : p))
+        );
+      } else {
+        const error = await response.json();
+        alert((t.errorUpdatingFavorite || 'Error updating favorite') + ': ' + (error.message || ''));
+      }
+    } catch (error) {
+      console.error('Error updating favorite:', error);
+      alert(t.errorUpdatingFavorite || 'Error updating favorite');
+    }
+  };
+
+  const addSeason = async () => {
+    const name = newSeasonName.trim();
+    if (!name) {
+      alert(t.seasonNameRequired);
+      return;
+    }
+    try {
+      const response = await fetch(SEASONS_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      if (response.ok) {
+        setNewSeasonName('');
+        await fetchSeasons();
+      } else {
+        const err = await response.json().catch(() => ({}));
+        const message = err.description || err.message || t.errorSavingSeason;
+        alert(message);
+      }
+    } catch (error) {
+      console.error('Error adding season:', error);
+      alert(t.errorSavingSeason);
+    }
+  };
+
+  const removeSeason = async (seasonId) => {
+    if (!window.confirm(t.confirmRemoveSeason)) return;
+    try {
+      const response = await fetch(`${SEASONS_API}/${seasonId}`, { method: 'DELETE' });
+      if (response.ok) {
+        await fetchSeasons();
+      } else {
+        const err = await response.json().catch(() => ({}));
+        alert(err.description || err.message || t.errorRemovingSeason);
+      }
+    } catch (error) {
+      console.error('Error removing season:', error);
+      alert(t.errorRemovingSeason);
+    }
+  };
+
+  const renderBulkAddActivityModal = () => (
+    <Modal
+      animationType="slide"
+      transparent={true}
+      visible={bulkAddActivityModalVisible}
+      onRequestClose={() => {
+        setBulkAddActivityModalVisible(false);
+        setBulkAddActivityDescription('');
+        setBulkAddActivityDistributor('');
+        setBulkAddDistributorDropdownOpen(false);
+        setBulkAddSeasonDropdownOpen(false);
+      }}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={[styles.modalContent, isRTL && styles.modalContentRTL]}>
+          <Text style={styles.modalTitle}>
+            {t.addActivityToSelected || 'Add Activity'} ({selectedPersonsForActivities.length})
+          </Text>
+          <View style={[styles.form, styles.bulkAddForm]}>
+            <View style={styles.formGroup}>
+              <Text style={styles.label}>{t.activityDescription}</Text>
+              <TextInput
+                style={[styles.input, isRTL && styles.inputRTL]}
+                value={bulkAddActivityDescription}
+                onChangeText={setBulkAddActivityDescription}
+                placeholder={t.activityDescription}
+                multiline
+                textAlign={isRTL ? 'right' : 'left'}
+              />
+            </View>
+            <View style={[styles.formGroup, styles.bulkAddDistributorFormGroup]}>
+              <Text style={styles.label}>{t.distributor}</Text>
+              <TouchableOpacity
+                style={styles.distributorSelectButton}
+                onPress={() => setBulkAddDistributorDropdownOpen(!bulkAddDistributorDropdownOpen)}
+              >
+                <Text style={styles.distributorSelectButtonText}>
+                  {bulkAddActivityDistributor || t.selectDistributor}
+                </Text>
+                <Text style={styles.distributorSelectArrow}>
+                  {bulkAddDistributorDropdownOpen ? '▲' : '▼'}
+                </Text>
+              </TouchableOpacity>
+              {bulkAddDistributorDropdownOpen && (
+                <View style={styles.distributorDropdown}>
+                  <ScrollView style={styles.distributorDropdownScroll} nestedScrollEnabled={true}>
+                    <TouchableOpacity
+                      style={styles.distributorOption}
+                      onPress={() => {
+                        setBulkAddActivityDistributor('');
+                        setBulkAddDistributorDropdownOpen(false);
+                      }}
+                    >
+                      <Text style={styles.distributorOptionText}>{t.noDistributor}</Text>
+                    </TouchableOpacity>
+                    {distributors.map(distributor => (
+                      <TouchableOpacity
+                        key={distributor.id}
+                        style={styles.distributorOption}
+                        onPress={() => {
+                          setBulkAddActivityDistributor(distributor.name);
+                          setBulkAddDistributorDropdownOpen(false);
+                        }}
+                      >
+                        <Text style={styles.distributorOptionText}>
+                          {distributor.name} ({distributor.phone})
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
+              )}
+            </View>
+            <View style={[styles.formGroup, styles.bulkAddDistributorFormGroup]}>
+              <Text style={styles.label}>{t.selectSeason}</Text>
+              <TouchableOpacity
+                style={styles.distributorSelectButton}
+                onPress={() => setBulkAddSeasonDropdownOpen(!bulkAddSeasonDropdownOpen)}
+              >
+                <Text style={styles.distributorSelectButtonText}>
+                  {bulkAddActivitySeasonId && seasons.find(s => String(s._id) === String(bulkAddActivitySeasonId))
+                    ? seasons.find(s => String(s._id) === String(bulkAddActivitySeasonId)).name
+                    : t.selectSeason}
+                </Text>
+                <Text style={styles.distributorSelectArrow}>
+                  {bulkAddSeasonDropdownOpen ? '▲' : '▼'}
+                </Text>
+              </TouchableOpacity>
+              {bulkAddSeasonDropdownOpen && (
+                <View style={styles.distributorDropdown}>
+                  <ScrollView style={styles.distributorDropdownScroll} nestedScrollEnabled={true}>
+                    {seasons.map(season => (
+                      <TouchableOpacity
+                        key={season._id}
+                        style={styles.distributorOption}
+                        onPress={() => {
+                          setBulkAddActivitySeasonId(season._id);
+                          setBulkAddSeasonDropdownOpen(false);
+                        }}
+                      >
+                        <Text style={styles.distributorOptionText}>{season.name}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
+              )}
+            </View>
+            <View style={[styles.formGroup, { flexDirection: isRTL ? 'row-reverse' : 'row', gap: 10, marginTop: 16 }]}>
+              <TouchableOpacity
+                style={[styles.cancelButton, { flex: 1 }]}
+                onPress={() => {
+                  setBulkAddActivityModalVisible(false);
+                  setBulkAddActivityDescription('');
+                  setBulkAddActivityDistributor('');
+                  setBulkAddDistributorDropdownOpen(false);
+                  setBulkAddSeasonDropdownOpen(false);
+                }}
+              >
+                <Text style={styles.cancelButtonText}>{t.close}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.addButton, { flex: 1 }]}
+                onPress={() => {
+                  if (bulkAddActivityDescription.trim()) {
+                    addActivityToSelected(
+                      bulkAddActivityDescription.trim(),
+                      bulkAddActivityDistributor,
+                      bulkAddActivitySeasonId
+                    );
+                  } else {
+                    alert(t.activityDescription || 'Enter activity description');
+                  }
+                }}
+              >
+                <Text style={styles.addButtonText}>{t.add}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  const checkboxHeaderCellStyle = {
+    width: 50,
+    flex: 0,
+    minWidth: 50,
+    maxWidth: 50,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 8
+  };
+
   // Render Open Activities page
   const renderOpenActivitiesPage = () => {
     const filteredActivities = getFilteredActivities();
+    const activityGroups = groupActivitiesBySeason(filteredActivities);
+    const visiblePersonIds = [...new Set(filteredActivities.map(a => a.personId).filter(Boolean))];
+    const allVisiblePeopleSelected =
+      visiblePersonIds.length > 0 &&
+      visiblePersonIds.every(pid =>
+        selectedPersonsForActivities.some(sid => String(sid) === String(pid))
+      );
 
     return (
       <View style={[styles.container, isRTL && styles.containerRTL]}>
         <View style={[styles.header, isRTL && styles.headerRTL]}>
           <Text style={styles.title}>{t.openActivities}</Text>
           <View style={styles.headerRight}>
+            {selectedPersonsForActivities.length > 0 && (
+              <>
+                <TouchableOpacity
+                  style={styles.exportSelectedExcelButton}
+                  onPress={exportSelectedOpenActivitiesToExcel}
+                >
+                  <Text style={styles.exportSelectedExcelButtonText}>
+                    {t.exportSelectedToExcel || 'Export to Excel'} ({selectedPersonsForActivities.length})
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.bulkActivityButton}
+                  onPress={() => {
+                    setBulkAddActivityModalVisible(true);
+                    if (seasons.length && !bulkAddActivitySeasonId) {
+                      setBulkAddActivitySeasonId(seasons[0]._id);
+                    }
+                  }}
+                >
+                  <Text style={styles.bulkActivityButtonText}>
+                    {t.addActivityToSelected || 'Add Activity'} ({selectedPersonsForActivities.length})
+                  </Text>
+                </TouchableOpacity>
+              </>
+            )}
             <TouchableOpacity 
               style={styles.exportExcelButton}
               onPress={exportToExcel}
@@ -766,8 +1382,17 @@ const App = () => {
               <Text style={styles.manageDistributorsButtonText}>{t.manageDistributors}</Text>
             </TouchableOpacity>
             <TouchableOpacity 
+              style={styles.manageDistributorsButton}
+              onPress={() => setSeasonModalVisible(true)}
+            >
+              <Text style={styles.manageDistributorsButtonText}>{t.manageSeasons}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
               style={styles.navButton}
-              onPress={() => setCurrentView('main')}
+              onPress={() => {
+                setSelectedPersonsForActivities([]);
+                setCurrentView('main');
+              }}
             >
               <Text style={styles.navButtonText}>{t.backToMain}</Text>
             </TouchableOpacity>
@@ -794,8 +1419,15 @@ const App = () => {
               onPress={() => {
                 setOpenActivitiesFilters({
                   distributor: '',
+                  season: '',
                   activityStatus: 'open',
-                  activityName: ''
+                  activityName: '',
+                  dateFromDay: '',
+                  dateFromMonth: '',
+                  dateFromYear: '',
+                  dateToDay: '',
+                  dateToMonth: '',
+                  dateToYear: ''
                 });
               }}
             >
@@ -913,7 +1545,72 @@ const App = () => {
                   </View>
                 </View>
               </View>
-              <View style={[styles.filterRow, isRTL && styles.filterRowRTL, { zIndex: 1 }]}>
+              <View style={[styles.filterRow, isRTL && styles.filterRowRTL, { zIndex: 8888888 }]}>
+                <View style={[styles.filterGroup, { zIndex: 8888888 }]}>
+                  <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.season}</Text>
+                  <View style={styles.distributorSelector}>
+                    <TouchableOpacity
+                      style={styles.distributorSelectButton}
+                      onPress={() => {
+                        const dropdownKey = 'filter-season';
+                        setOpenDropdowns(prev => ({
+                          ...prev,
+                          [dropdownKey]: !prev[dropdownKey]
+                        }));
+                      }}
+                    >
+                      <Text style={styles.distributorSelectButtonText}>
+                        {openActivitiesFilters.season === '__NO_SEASON__'
+                          ? t.noSeasonAssigned
+                          : openActivitiesFilters.season && seasons.find(s => String(s._id) === String(openActivitiesFilters.season))
+                            ? seasons.find(s => String(s._id) === String(openActivitiesFilters.season)).name
+                            : t.all}
+                      </Text>
+                      <Text style={styles.distributorSelectArrow}>
+                        {openDropdowns['filter-season'] ? '▲' : '▼'}
+                      </Text>
+                    </TouchableOpacity>
+                    {openDropdowns['filter-season'] && (
+                      <View style={styles.distributorDropdown}>
+                        <ScrollView
+                          style={styles.distributorDropdownScroll}
+                          nestedScrollEnabled={true}
+                        >
+                          <TouchableOpacity
+                            style={styles.distributorOption}
+                            onPress={() => {
+                              setOpenActivitiesFilters(prev => ({ ...prev, season: '' }));
+                              setOpenDropdowns(prev => ({ ...prev, 'filter-season': false }));
+                            }}
+                          >
+                            <Text style={styles.distributorOptionText}>{t.all}</Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.distributorOption}
+                            onPress={() => {
+                              setOpenActivitiesFilters(prev => ({ ...prev, season: '__NO_SEASON__' }));
+                              setOpenDropdowns(prev => ({ ...prev, 'filter-season': false }));
+                            }}
+                          >
+                            <Text style={styles.distributorOptionText}>{t.noSeasonAssigned}</Text>
+                          </TouchableOpacity>
+                          {seasons.map(season => (
+                            <TouchableOpacity
+                              key={season._id}
+                              style={styles.distributorOption}
+                              onPress={() => {
+                                setOpenActivitiesFilters(prev => ({ ...prev, season: String(season._id) }));
+                                setOpenDropdowns(prev => ({ ...prev, 'filter-season': false }));
+                              }}
+                            >
+                              <Text style={styles.distributorOptionText}>{season.name}</Text>
+                            </TouchableOpacity>
+                          ))}
+                        </ScrollView>
+                      </View>
+                    )}
+                  </View>
+                </View>
                 <View style={[styles.filterGroup, { zIndex: 1 }]}>
                   <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.activityName}</Text>
                   <TextInput
@@ -923,6 +1620,96 @@ const App = () => {
                     placeholder={t.searchActivityName}
                     textAlign={isRTL ? 'right' : 'left'}
                   />
+                </View>
+              </View>
+              <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
+                <View style={[styles.filterGroup, styles.timelineFilterGroup]}>
+                  <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.timelineFrom}</Text>
+                  <View style={styles.birthdayRow}>
+                    <TextInput
+                      style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                      value={openActivitiesFilters.dateFromDay}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({
+                          ...prev,
+                          dateFromDay: text.replace(/\D/g, '').slice(0, 2)
+                        }))
+                      }
+                      placeholder={t.day}
+                      keyboardType="number-pad"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                    <TextInput
+                      style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                      value={openActivitiesFilters.dateFromMonth}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({
+                          ...prev,
+                          dateFromMonth: text.replace(/\D/g, '').slice(0, 2)
+                        }))
+                      }
+                      placeholder={t.month}
+                      keyboardType="number-pad"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                    <TextInput
+                      style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                      value={openActivitiesFilters.dateFromYear}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({
+                          ...prev,
+                          dateFromYear: text.replace(/\D/g, '').slice(0, 4)
+                        }))
+                      }
+                      placeholder={t.year}
+                      keyboardType="number-pad"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                  </View>
+                </View>
+                <View style={[styles.filterGroup, styles.timelineFilterGroup]}>
+                  <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.timelineTo}</Text>
+                  <View style={styles.birthdayRow}>
+                    <TextInput
+                      style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                      value={openActivitiesFilters.dateToDay}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({
+                          ...prev,
+                          dateToDay: text.replace(/\D/g, '').slice(0, 2)
+                        }))
+                      }
+                      placeholder={t.day}
+                      keyboardType="number-pad"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                    <TextInput
+                      style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                      value={openActivitiesFilters.dateToMonth}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({
+                          ...prev,
+                          dateToMonth: text.replace(/\D/g, '').slice(0, 2)
+                        }))
+                      }
+                      placeholder={t.month}
+                      keyboardType="number-pad"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                    <TextInput
+                      style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                      value={openActivitiesFilters.dateToYear}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({
+                          ...prev,
+                          dateToYear: text.replace(/\D/g, '').slice(0, 4)
+                        }))
+                      }
+                      placeholder={t.year}
+                      keyboardType="number-pad"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                  </View>
                 </View>
               </View>
             </View>
@@ -935,9 +1722,40 @@ const App = () => {
         >
           <View style={[styles.table, isRTL && styles.tableRTL]}>
             <View style={[styles.tableHeader, isRTL && styles.tableHeaderRTL]}>
+              <View style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, checkboxHeaderCellStyle]}>
+                <TouchableOpacity
+                  style={[
+                    styles.checkbox,
+                    allVisiblePeopleSelected && visiblePersonIds.length > 0 && styles.checkboxChecked
+                  ]}
+                  onPress={() => {
+                    if (allVisiblePeopleSelected) {
+                      setSelectedPersonsForActivities(prev =>
+                        prev.filter(id => !visiblePersonIds.some(vid => String(vid) === String(id)))
+                      );
+                    } else {
+                      setSelectedPersonsForActivities(prev => {
+                        const next = [...prev];
+                        visiblePersonIds.forEach(vid => {
+                          if (!next.some(id => String(id) === String(vid))) {
+                            next.push(vid);
+                          }
+                        });
+                        return next;
+                      });
+                    }
+                  }}
+                  disabled={visiblePersonIds.length === 0}
+                >
+                  {allVisiblePeopleSelected && visiblePersonIds.length > 0 && (
+                    <Text style={styles.checkboxCheckmark}>✓</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
               <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { flex: 2 }]}>{t.name}</Text>
               <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL]}>{t.kids}</Text>
               <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { flex: 2 }]}>{t.activity}</Text>
+              <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { flex: 1.4 }]}>{t.season}</Text>
               <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { flex: 2 }]}>{t.distributor}</Text>
               <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL]}>{t.status}</Text>
             </View>
@@ -947,14 +1765,41 @@ const App = () => {
                 <Text style={styles.emptyText}>{t.noActivitiesFound}</Text>
               </View>
             ) : (
-              filteredActivities.map((activity, index) => {
+              activityGroups.map((group) => (
+                <View key={group.key}>
+                  <View style={[styles.seasonSectionHeader, isRTL && styles.seasonSectionHeaderRTL]}>
+                    <Text style={[styles.seasonSectionHeaderText, isRTL && styles.seasonSectionHeaderTextRTL]}>{group.title}</Text>
+                  </View>
+                  {group.activities.map((activity, index) => {
                 const isPending = (activity.activityStatus === 'pending' || !activity.activityStatus) && activity.description;
-                const isCompleted = activity.activityStatus === 'completed';
                 const hasNoActivity = !activity.description || activity.activityStatus === 'none';
                 
-                const isDropdownOpen = openDropdowns[`${activity.personId}-${activity.activityIndex}`];
+                const distDropdownKey = `${activity.personId}-${activity.activityIndex}`;
+                const seasonDropdownKey = `season-${activity.personId}-${activity.activityIndex}`;
+                const isDistOpen = openDropdowns[distDropdownKey];
+                const isSeasonOpen = openDropdowns[seasonDropdownKey];
+                const isDropdownOpen = isDistOpen || isSeasonOpen;
+                const isPersonSelected = selectedPersonsForActivities.some(
+                  sid => String(sid) === String(activity.personId)
+                );
                 return (
-                  <View key={`${activity.personId}-${activity.date}-${index}`} style={[styles.tableRow, isRTL && styles.tableRowRTL, { zIndex: isDropdownOpen ? 99999999 : 1 }]}>
+                  <View key={`${activity.personId}-${activity.date}-${group.key}-${index}`} style={[styles.tableRow, isRTL && styles.tableRowRTL, { zIndex: isDropdownOpen ? 99999999 : 1 }]}>
+                    <View style={[styles.tableCell, checkboxHeaderCellStyle]}>
+                      <TouchableOpacity
+                        style={[styles.checkbox, isPersonSelected && styles.checkboxChecked]}
+                        onPress={() => {
+                          if (isPersonSelected) {
+                            setSelectedPersonsForActivities(prev =>
+                              prev.filter(id => String(id) !== String(activity.personId))
+                            );
+                          } else {
+                            setSelectedPersonsForActivities(prev => [...prev, activity.personId]);
+                          }
+                        }}
+                      >
+                        {isPersonSelected && <Text style={styles.checkboxCheckmark}>✓</Text>}
+                      </TouchableOpacity>
+                    </View>
                     <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL, { flex: 2 }]}>
                       {activity.personName}
                     </Text>
@@ -964,17 +1809,79 @@ const App = () => {
                     <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL, { flex: 2 }]}>
                       {activity.description || '-'}
                     </Text>
-                  <View style={[styles.tableCell, { flex: 2, zIndex: openDropdowns[`${activity.personId}-${activity.activityIndex}`] ? 99999999 : 1 }]}>
+                  <View style={[styles.tableCell, { flex: 1.4, zIndex: isSeasonOpen ? 99999999 : 1 }]}>
                     {activity.activityStatus !== 'none' ? (
-                      <View style={[styles.distributorSelector, { zIndex: openDropdowns[`${activity.personId}-${activity.activityIndex}`] ? 99999999 : 1 }]}>
+                      <View style={[styles.distributorSelector, { zIndex: isSeasonOpen ? 99999999 : 1 }]}>
                         <TouchableOpacity
                           style={styles.distributorSelectButton}
                           onPress={(e) => {
                             e.stopPropagation();
-                            const dropdownKey = `${activity.personId}-${activity.activityIndex}`;
                             setOpenDropdowns(prev => ({
                               ...prev,
-                              [dropdownKey]: !prev[dropdownKey]
+                              [seasonDropdownKey]: !prev[seasonDropdownKey]
+                            }));
+                          }}
+                        >
+                          <Text style={styles.distributorSelectButtonText} numberOfLines={1}>
+                            {activity.seasonName || t.noSeasonAssigned}
+                          </Text>
+                          <Text style={styles.distributorSelectArrow}>
+                            {openDropdowns[seasonDropdownKey] ? '▲' : '▼'}
+                          </Text>
+                        </TouchableOpacity>
+                        {openDropdowns[seasonDropdownKey] && (
+                          <View style={[styles.distributorDropdown, { zIndex: 99999999 }]}>
+                            <ScrollView 
+                              style={styles.distributorDropdownScroll}
+                              nestedScrollEnabled={true}
+                            >
+                              <TouchableOpacity
+                                style={styles.distributorOption}
+                                onPress={(e) => {
+                                  e.stopPropagation();
+                                  updateActivitySeason(activity.personId, activity.activityIndex, null);
+                                  setOpenDropdowns(prev => ({
+                                    ...prev,
+                                    [seasonDropdownKey]: false
+                                  }));
+                                }}
+                              >
+                                <Text style={styles.distributorOptionText}>{t.noSeasonAssigned}</Text>
+                              </TouchableOpacity>
+                              {seasons.map(season => (
+                                <TouchableOpacity
+                                  key={season._id}
+                                  style={styles.distributorOption}
+                                  onPress={(e) => {
+                                    e.stopPropagation();
+                                    updateActivitySeason(activity.personId, activity.activityIndex, season._id);
+                                    setOpenDropdowns(prev => ({
+                                      ...prev,
+                                      [seasonDropdownKey]: false
+                                    }));
+                                  }}
+                                >
+                                  <Text style={styles.distributorOptionText}>{season.name}</Text>
+                                </TouchableOpacity>
+                              ))}
+                            </ScrollView>
+                          </View>
+                        )}
+                      </View>
+                    ) : (
+                      <Text style={[styles.tableCellText, isRTL && styles.tableCellRTL]}>-</Text>
+                    )}
+                  </View>
+                  <View style={[styles.tableCell, { flex: 2, zIndex: isDistOpen ? 99999999 : 1 }]}>
+                    {activity.activityStatus !== 'none' ? (
+                      <View style={[styles.distributorSelector, { zIndex: isDistOpen ? 99999999 : 1 }]}>
+                        <TouchableOpacity
+                          style={styles.distributorSelectButton}
+                          onPress={(e) => {
+                            e.stopPropagation();
+                            setOpenDropdowns(prev => ({
+                              ...prev,
+                              [distDropdownKey]: !prev[distDropdownKey]
                             }));
                           }}
                         >
@@ -982,10 +1889,10 @@ const App = () => {
                             {activity.distributor || t.selectDistributor}
                           </Text>
                           <Text style={styles.distributorSelectArrow}>
-                            {openDropdowns[`${activity.personId}-${activity.activityIndex}`] ? '▲' : '▼'}
+                            {openDropdowns[distDropdownKey] ? '▲' : '▼'}
                           </Text>
                         </TouchableOpacity>
-                        {openDropdowns[`${activity.personId}-${activity.activityIndex}`] && (
+                        {openDropdowns[distDropdownKey] && (
                           <View style={[styles.distributorDropdown, { zIndex: 99999999 }]}>
                             <ScrollView 
                               style={styles.distributorDropdownScroll}
@@ -998,7 +1905,7 @@ const App = () => {
                                   updateActivityDistributor(activity.personId, activity.activityIndex, '');
                                   setOpenDropdowns(prev => ({
                                     ...prev,
-                                    [`${activity.personId}-${activity.activityIndex}`]: false
+                                    [distDropdownKey]: false
                                   }));
                                 }}
                               >
@@ -1013,7 +1920,7 @@ const App = () => {
                                     updateActivityDistributor(activity.personId, activity.activityIndex, distributor.name);
                                     setOpenDropdowns(prev => ({
                                       ...prev,
-                                      [`${activity.personId}-${activity.activityIndex}`]: false
+                                      [distDropdownKey]: false
                                     }));
                                   }}
                                 >
@@ -1052,7 +1959,9 @@ const App = () => {
                   </View>
                 </View>
                 );
-              })
+                  })}
+                </View>
+              ))
             )}
           </View>
         </ScrollView>
@@ -1134,6 +2043,74 @@ const App = () => {
             </View>
           </View>
         </Modal>
+
+        {/* Season Management Modal */}
+        <Modal
+          animationType="slide"
+          transparent={true}
+          visible={seasonModalVisible}
+          onRequestClose={() => setSeasonModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={[styles.modalContent, isRTL && styles.modalContentRTL]}>
+              <Text style={styles.modalTitle}>{t.manageSeasons}</Text>
+
+              <ScrollView style={styles.form}>
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>{t.addNewSeason}</Text>
+                  <TextInput
+                    style={[styles.input, isRTL && styles.inputRTL]}
+                    value={newSeasonName}
+                    onChangeText={setNewSeasonName}
+                    placeholder={t.seasonNamePlaceholder}
+                    textAlign={isRTL ? 'right' : 'left'}
+                  />
+                  <TouchableOpacity
+                    style={styles.addDistributorButton}
+                    onPress={addSeason}
+                  >
+                    <Text style={styles.addDistributorButtonText}>{t.add}</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>{t.seasonsList} ({seasons.length})</Text>
+                  {seasons.length === 0 ? (
+                    <Text style={styles.hintText}>{t.noSeasons}</Text>
+                  ) : (
+                    seasons.map(season => (
+                      <View key={season._id} style={styles.distributorItem}>
+                        <View style={styles.distributorItemInfo}>
+                          <Text style={styles.distributorItemName}>{season.name}</Text>
+                        </View>
+                        <TouchableOpacity
+                          style={styles.removeDistributorButton}
+                          onPress={() => removeSeason(season._id)}
+                        >
+                          <Text style={styles.removeDistributorButtonText}>{t.remove}</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ))
+                  )}
+                </View>
+              </ScrollView>
+
+              <View style={[styles.modalButtons, isRTL && styles.modalButtonsRTL]}>
+                <TouchableOpacity
+                  style={[styles.modalButton, styles.cancelButton]}
+                  onPress={() => {
+                    setSeasonModalVisible(false);
+                    setNewSeasonName('');
+                  }}
+                >
+                  <Text style={styles.cancelButtonText}>{t.close}</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {renderBulkAddActivityModal()}
       </View>
     );
   };
@@ -1149,24 +2126,36 @@ const App = () => {
         <Text style={styles.title}>{t.title}</Text>
         <View style={styles.headerRight}>
           {selectedPersonsForActivities.length > 0 && (
-            <TouchableOpacity 
-              style={styles.bulkActivityButton}
-              onPress={() => {
-                const activityDescription = prompt(t.enterActivityDescription || 'Enter activity description:');
-                if (activityDescription && activityDescription.trim()) {
-                  addActivityToSelected(activityDescription);
-                }
-              }}
-            >
-              <Text style={styles.bulkActivityButtonText}>
-                {t.addActivityToSelected || 'Add Activity'} ({selectedPersonsForActivities.length})
-              </Text>
-            </TouchableOpacity>
+            <>
+              <TouchableOpacity
+                style={styles.exportSelectedExcelButton}
+                onPress={exportSelectedPersonsToExcel}
+              >
+                <Text style={styles.exportSelectedExcelButtonText}>
+                  {t.exportSelectedToExcel || 'Export to Excel'} ({selectedPersonsForActivities.length})
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={styles.bulkActivityButton}
+                onPress={() => {
+                  setBulkAddActivityModalVisible(true);
+                  if (seasons.length && !bulkAddActivitySeasonId) {
+                    setBulkAddActivitySeasonId(seasons[0]._id);
+                  }
+                }}
+              >
+                <Text style={styles.bulkActivityButtonText}>
+                  {t.addActivityToSelected || 'Add Activity'} ({selectedPersonsForActivities.length})
+                </Text>
+              </TouchableOpacity>
+            </>
           )}
           <TouchableOpacity 
             style={styles.navButton}
             onPress={() => {
-              fetchPersons(); // Refresh data before showing
+              fetchPersons();
+              fetchSeasons();
+              setSelectedPersonsForActivities([]);
               setCurrentView('openActivities');
             }}
           >
@@ -1183,6 +2172,8 @@ const App = () => {
           </TouchableOpacity>
         </View>
       </View>
+
+      {renderBulkAddActivityModal()}
 
       {/* Search Bar */}
       <View style={[styles.searchContainer, isRTL && styles.searchContainerRTL]}>
@@ -1202,6 +2193,42 @@ const App = () => {
             <Text style={styles.clearSearchButtonText}>✕</Text>
           </TouchableOpacity>
         )}
+      </View>
+
+      {/* Favorites Filter */}
+      <View style={[styles.favoritesFilterContainer, isRTL && styles.favoritesFilterContainerRTL]}>
+        <TouchableOpacity
+          style={[
+            styles.favoritesFilterButton,
+            !showFavoritesOnly && styles.favoritesFilterButtonActive
+          ]}
+          onPress={() => setShowFavoritesOnly(false)}
+        >
+          <Text
+            style={[
+              styles.favoritesFilterButtonText,
+              !showFavoritesOnly && styles.favoritesFilterButtonTextActive
+            ]}
+          >
+            {t.favoritesFilterAll}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[
+            styles.favoritesFilterButton,
+            showFavoritesOnly && styles.favoritesFilterButtonActive
+          ]}
+          onPress={() => setShowFavoritesOnly(true)}
+        >
+          <Text
+            style={[
+              styles.favoritesFilterButtonText,
+              showFavoritesOnly && styles.favoritesFilterButtonTextActive
+            ]}
+          >
+            {t.favoritesFilterFavorites}
+          </Text>
+        </TouchableOpacity>
       </View>
 
       {/* Filters Section */}
@@ -1426,8 +2453,31 @@ const App = () => {
       <ScrollView style={styles.scrollView}>
         <View style={[styles.table, isRTL && styles.tableRTL]}>
           <View style={[styles.tableHeader, isRTL && styles.tableHeaderRTL]}>
-            <View style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { width: 50, flex: 0, minWidth: 50, maxWidth: 50 }]}>
-              <Text style={[styles.headerCellText, isRTL && styles.headerCellRTL]}></Text>
+            <View style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { width: 50, flex: 0, minWidth: 50, maxWidth: 50, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 8 }]}>
+              <TouchableOpacity
+                style={[
+                  styles.checkbox,
+                  filteredPersons.length > 0 && filteredPersons.every(p => selectedPersonsForActivities.includes(p._id)) && styles.checkboxChecked
+                ]}
+                onPress={() => {
+                  const filteredIds = filteredPersons.map(p => p._id);
+                  const allFilteredSelected = filteredPersons.length > 0 && filteredPersons.every(p => selectedPersonsForActivities.includes(p._id));
+                  if (allFilteredSelected) {
+                    setSelectedPersonsForActivities(prev => prev.filter(id => !filteredIds.includes(id)));
+                  } else {
+                    const combined = [...new Set([...selectedPersonsForActivities, ...filteredIds])];
+                    setSelectedPersonsForActivities(combined);
+                  }
+                }}
+                disabled={filteredPersons.length === 0}
+              >
+                {filteredPersons.length > 0 && filteredPersons.every(p => selectedPersonsForActivities.includes(p._id)) && (
+                  <Text style={styles.checkboxCheckmark}>✓</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+            <View style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { width: 50, flex: 0, minWidth: 50, maxWidth: 50, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 8 }]}>
+              <Text style={styles.favoriteHeaderIcon}>★</Text>
             </View>
             <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { flex: 2 }]}>{t.name}</Text>
             <Text style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL]}>{t.phone}</Text>
@@ -1460,8 +2510,11 @@ const App = () => {
 
           {paginatedPersons.map((person) => {
             const hasKids = person.kids && person.kids.length > 0;
+            const hasDescription = person.description && String(person.description).trim();
+            const hasExpandableDetails = hasKids || hasDescription;
             const isExpanded = expandedKids[person._id];
             const isSelected = selectedPersonsForActivities.includes(person._id);
+            const isFavorite = !!person.favorite;
             
             return (
               <View key={person._id}>
@@ -1480,8 +2533,15 @@ const App = () => {
                       {isSelected && <Text style={styles.checkboxCheckmark}>✓</Text>}
                     </TouchableOpacity>
                   </View>
+                  <View style={[styles.tableCell, { width: 50, flex: 0, minWidth: 50, maxWidth: 50, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 8 }]}>
+                    <TouchableOpacity onPress={() => toggleFavorite(person._id)}>
+                      <Text style={[styles.favoriteIcon, isFavorite && styles.favoriteIconActive]}>
+                        {isFavorite ? '★' : '☆'}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
                   <View style={[styles.tableCell, { flex: 2, flexDirection: isRTL ? 'row-reverse' : 'row', alignItems: 'center' }]}>
-                    {hasKids && (
+                    {hasExpandableDetails && (
                       <TouchableOpacity 
                         style={styles.expandButton}
                         onPress={() => toggleKidsVisibility(person._id)}
@@ -1495,11 +2555,11 @@ const App = () => {
                   </View>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.phone}</Text>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.kidsNumber || 0}</Text>
-                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.monthIncome}</Text>
+                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.monthIncome != null && person.monthIncome !== '' ? person.monthIncome : ''}</Text>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{t[person.maritalStatus.toLowerCase()] || person.maritalStatus}</Text>
-                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.liveInRenta ? t.yes : t.no}</Text>
-                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.hasCar ? t.yes : t.no}</Text>
-                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.bankNumber}</Text>
+                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.liveInRenta === true ? t.yes : person.liveInRenta === false ? t.no : (t.noAvailableData || 'No available data')}</Text>
+                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.hasCar === true ? t.yes : person.hasCar === false ? t.no : (t.noAvailableData || 'No available data')}</Text>
+                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.bankNumber || ''}</Text>
                   <View style={[styles.tableCell, styles.actionsCell]}>
                     <TouchableOpacity 
                       style={styles.activitiesButton} 
@@ -1515,20 +2575,30 @@ const App = () => {
                     </TouchableOpacity>
                   </View>
                 </View>
-                {hasKids && isExpanded && (
+                {hasExpandableDetails && isExpanded && (
                   <View style={[styles.kidsDetailsRow, isRTL && styles.kidsDetailsRowRTL]}>
-                    <Text style={[styles.kidsLabel, isRTL && styles.kidsLabelRTL]}>{t.kidsDetails}</Text>
-                    {person.kids.map((kid, index) => {
-                      const age = calculateAge(kid.birthday);
-                      return (
-                        <View key={index} style={styles.kidItem}>
-                          <Text style={[styles.kidText, isRTL && styles.kidTextRTL]}>
-                            {kid.name} - {t.age} {age !== null ? `${age} ${t.years}` : 'N/A'}
-                            {kid.birthday && ` (${t.born} ${new Date(kid.birthday).toLocaleDateString()})`}
-                          </Text>
-                        </View>
-                      );
-                    })}
+                    {hasKids && (
+                      <View style={styles.detailSection}>
+                        <Text style={[styles.kidsLabel, isRTL && styles.kidsLabelRTL]}>{t.kidsDetails}</Text>
+                        {person.kids.map((kid, index) => {
+                          const age = calculateAge(kid.birthday);
+                          return (
+                            <View key={index} style={styles.kidItem}>
+                              <Text style={[styles.kidText, isRTL && styles.kidTextRTL]}>
+                                {kid.name} - {t.age} {age !== null ? `${age} ${t.years}` : 'N/A'}
+                                {kid.birthday && ` (${t.born} ${new Date(kid.birthday).toLocaleDateString()})`}
+                              </Text>
+                            </View>
+                          );
+                        })}
+                      </View>
+                    )}
+                    {hasDescription && (
+                      <View style={[styles.detailSection, hasKids && { marginTop: 8 }]}>
+                        <Text style={[styles.kidsLabel, isRTL && styles.kidsLabelRTL]}>{t.description}</Text>
+                        <Text style={[styles.kidText, isRTL && styles.kidTextRTL]}>{person.description.trim()}</Text>
+                      </View>
+                    )}
                   </View>
                 )}
               </View>
@@ -1674,14 +2744,32 @@ const App = () => {
                       placeholder={t.kidsName}
                       textAlign={isRTL ? 'right' : 'left'}
                     />
-                    <TextInput
-                      style={[styles.input, isRTL && styles.inputRTL]}
-                      value={kid.birthday}
-                      onChangeText={(text) => updateKid(index, 'birthday', text)}
-                      placeholder={t.birthday}
-                      keyboardType="default"
-                      textAlign={isRTL ? 'right' : 'left'}
-                    />
+                    <View style={styles.birthdayRow}>
+                      <TextInput
+                        style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                        value={getKidBirthdayPart(kid, 'day')}
+                        onChangeText={(text) => updateKidBirthdayPart(index, 'day', text.replace(/\D/g, '').slice(0, 2))}
+                        placeholder={t.day}
+                        keyboardType="number-pad"
+                        textAlign={isRTL ? 'right' : 'left'}
+                      />
+                      <TextInput
+                        style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                        value={getKidBirthdayPart(kid, 'month')}
+                        onChangeText={(text) => updateKidBirthdayPart(index, 'month', text.replace(/\D/g, '').slice(0, 2))}
+                        placeholder={t.month}
+                        keyboardType="number-pad"
+                        textAlign={isRTL ? 'right' : 'left'}
+                      />
+                      <TextInput
+                        style={[styles.birthdayInput, isRTL && styles.inputRTL]}
+                        value={getKidBirthdayPart(kid, 'year')}
+                        onChangeText={(text) => updateKidBirthdayPart(index, 'year', text.replace(/\D/g, '').slice(0, 4))}
+                        placeholder={t.year}
+                        keyboardType="number-pad"
+                        textAlign={isRTL ? 'right' : 'left'}
+                      />
+                    </View>
                     {kid.birthday && calculateAge(kid.birthday) !== null && (
                       <Text style={styles.ageText}>
                         {t.age} {calculateAge(kid.birthday)} {t.years}
@@ -1737,22 +2825,50 @@ const App = () => {
               </View>
 
               <View style={styles.formGroup}>
-                <View style={[styles.switchGroup, isRTL && styles.switchGroupRTL]}>
-                  <Text style={styles.label}>{t.liveInRenta}</Text>
-                  <Switch
-                    value={formData.liveInRenta}
-                    onValueChange={(value) => setFormData({ ...formData, liveInRenta: value })}
-                  />
+                <Text style={styles.label}>{t.liveInRenta}</Text>
+                <View style={[styles.radioGroup, isRTL && styles.radioGroupRTL]}>
+                  <TouchableOpacity
+                    style={[styles.radioOption, formData.liveInRenta === true && styles.radioOptionSelected]}
+                    onPress={() => setFormData({ ...formData, liveInRenta: true })}
+                  >
+                    <Text style={[styles.radioText, formData.liveInRenta === true && styles.radioTextSelected]}>{t.yes}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.radioOption, formData.liveInRenta === false && styles.radioOptionSelected]}
+                    onPress={() => setFormData({ ...formData, liveInRenta: false })}
+                  >
+                    <Text style={[styles.radioText, formData.liveInRenta === false && styles.radioTextSelected]}>{t.no}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.radioOption, (formData.liveInRenta === null || formData.liveInRenta === undefined) && styles.radioOptionSelected]}
+                    onPress={() => setFormData({ ...formData, liveInRenta: null })}
+                  >
+                    <Text style={[styles.radioText, (formData.liveInRenta === null || formData.liveInRenta === undefined) && styles.radioTextSelected]}>{t.noAvailableData}</Text>
+                  </TouchableOpacity>
                 </View>
               </View>
 
               <View style={styles.formGroup}>
-                <View style={[styles.switchGroup, isRTL && styles.switchGroupRTL]}>
-                  <Text style={styles.label}>{t.hasCar}</Text>
-                  <Switch
-                    value={formData.hasCar}
-                    onValueChange={(value) => setFormData({ ...formData, hasCar: value })}
-                  />
+                <Text style={styles.label}>{t.hasCar}</Text>
+                <View style={[styles.radioGroup, isRTL && styles.radioGroupRTL]}>
+                  <TouchableOpacity
+                    style={[styles.radioOption, formData.hasCar === true && styles.radioOptionSelected]}
+                    onPress={() => setFormData({ ...formData, hasCar: true })}
+                  >
+                    <Text style={[styles.radioText, formData.hasCar === true && styles.radioTextSelected]}>{t.yes}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.radioOption, formData.hasCar === false && styles.radioOptionSelected]}
+                    onPress={() => setFormData({ ...formData, hasCar: false })}
+                  >
+                    <Text style={[styles.radioText, formData.hasCar === false && styles.radioTextSelected]}>{t.no}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.radioOption, (formData.hasCar === null || formData.hasCar === undefined) && styles.radioOptionSelected]}
+                    onPress={() => setFormData({ ...formData, hasCar: null })}
+                  >
+                    <Text style={[styles.radioText, (formData.hasCar === null || formData.hasCar === undefined) && styles.radioTextSelected]}>{t.noAvailableData}</Text>
+                  </TouchableOpacity>
                 </View>
               </View>
 
@@ -1764,6 +2880,19 @@ const App = () => {
                   onChangeText={(text) => setFormData({ ...formData, bankNumber: text })}
                   placeholder={isRTL ? 'أدخل رقم البنك' : 'Enter bank number'}
                   textAlign={isRTL ? 'right' : 'left'}
+                />
+              </View>
+
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>{t.descriptionField}</Text>
+                <TextInput
+                  style={[styles.input, styles.textArea, isRTL && styles.inputRTL]}
+                  value={formData.description}
+                  onChangeText={(text) => setFormData({ ...formData, description: text })}
+                  placeholder={t.descriptionPlaceholder}
+                  textAlign={isRTL ? 'right' : 'left'}
+                  multiline
+                  numberOfLines={3}
                 />
               </View>
             </ScrollView>
@@ -1801,6 +2930,40 @@ const App = () => {
 
             <ScrollView style={styles.form}>
               {/* Add New Activity */}
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>{t.selectSeason}</Text>
+                <TouchableOpacity
+                  style={styles.distributorSelectButton}
+                  onPress={() => setActivitySeasonDropdownOpen(!activitySeasonDropdownOpen)}
+                >
+                  <Text style={styles.distributorSelectButtonText}>
+                    {newActivitySeasonId && seasons.find(s => String(s._id) === String(newActivitySeasonId))
+                      ? seasons.find(s => String(s._id) === String(newActivitySeasonId)).name
+                      : t.selectSeason}
+                  </Text>
+                  <Text style={styles.distributorSelectArrow}>
+                    {activitySeasonDropdownOpen ? '▲' : '▼'}
+                  </Text>
+                </TouchableOpacity>
+                {activitySeasonDropdownOpen && (
+                  <View style={[styles.distributorDropdown, { marginBottom: 8 }]}>
+                    <ScrollView style={styles.distributorDropdownScroll} nestedScrollEnabled={true}>
+                      {seasons.map(season => (
+                        <TouchableOpacity
+                          key={season._id}
+                          style={styles.distributorOption}
+                          onPress={() => {
+                            setNewActivitySeasonId(season._id);
+                            setActivitySeasonDropdownOpen(false);
+                          }}
+                        >
+                          <Text style={styles.distributorOptionText}>{season.name}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  </View>
+                )}
+              </View>
               <View style={styles.formGroup}>
                 <Text style={styles.label}>{t.addNewActivity}</Text>
                 <View style={[styles.activityInputContainer, isRTL && styles.activityInputContainerRTL]}>
@@ -1845,6 +3008,9 @@ const App = () => {
                             </Text>
                             <Text style={[styles.activityDate, isRTL && styles.activityDateRTL]}>
                               {new Date(activity.date).toLocaleString()}
+                            </Text>
+                            <Text style={[styles.activityDate, isRTL && styles.activityDateRTL]}>
+                              {t.season}: {activity.season?.name || t.noSeasonAssigned}
                             </Text>
                             <TouchableOpacity
                               style={[
@@ -1977,6 +3143,25 @@ const styles = StyleSheet.create({
   tableHeaderRTL: {
     flexDirection: 'row-reverse',
   },
+  seasonSectionHeader: {
+    backgroundColor: '#e3f2fd',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#bbdefb',
+  },
+  seasonSectionHeaderRTL: {
+    alignItems: 'flex-end',
+  },
+  seasonSectionHeaderText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#1565c0',
+  },
+  seasonSectionHeaderTextRTL: {
+    textAlign: 'right',
+    width: '100%',
+  },
   tableRow: {
     flexDirection: 'row',
     borderBottomWidth: 1,
@@ -2077,6 +3262,11 @@ const styles = StyleSheet.create({
   form: {
     maxHeight: 400,
   },
+  /** Bulk add activity modal: allow dropdown to extend and stay visible */
+  bulkAddForm: {
+    overflow: 'visible',
+    maxHeight: 'none',
+  },
   formGroup: {
     marginBottom: 16,
   },
@@ -2093,6 +3283,10 @@ const styles = StyleSheet.create({
     padding: 12,
     fontSize: 16,
     backgroundColor: '#fff',
+  },
+  textArea: {
+    minHeight: 80,
+    textAlignVertical: 'top',
   },
   radioGroup: {
     flexDirection: 'row',
@@ -2184,6 +3378,9 @@ const styles = StyleSheet.create({
     padding: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#e9ecef',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 16,
   },
   kidsDetailsRowRTL: {
     direction: 'rtl',
@@ -2196,6 +3393,10 @@ const styles = StyleSheet.create({
   },
   kidsLabelRTL: {
     textAlign: 'right',
+  },
+  detailSection: {
+    minWidth: 200,
+    flex: 1,
   },
   kidItem: {
     marginBottom: 4,
@@ -2232,6 +3433,21 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 12,
     fontWeight: '600',
+  },
+  birthdayRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 4,
+  },
+  birthdayInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#dee2e6',
+    borderRadius: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 14,
+    minWidth: 0,
   },
   kidFormItem: {
     backgroundColor: '#f8f9fa',
@@ -2396,6 +3612,9 @@ const styles = StyleSheet.create({
     zIndex: 1,
     overflow: 'visible',
   },
+  timelineFilterGroup: {
+    minWidth: 200,
+  },
   filterLabel: {
     fontSize: 14,
     fontWeight: '600',
@@ -2500,6 +3719,50 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: '600',
   },
+  favoritesFilterContainer: {
+    flexDirection: 'row',
+    justifyContent: 'flex-start',
+    alignItems: 'center',
+    marginBottom: 12,
+    gap: 8,
+  },
+  favoritesFilterContainerRTL: {
+    flexDirection: 'row-reverse',
+    justifyContent: 'flex-end',
+  },
+  favoritesFilterButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#2196F3',
+    backgroundColor: '#fff',
+    minWidth: 110,
+    alignItems: 'center',
+  },
+  favoritesFilterButtonActive: {
+    backgroundColor: '#2196F3',
+  },
+  favoritesFilterButtonText: {
+    fontSize: 13,
+    color: '#2196F3',
+    fontWeight: '500',
+  },
+  favoritesFilterButtonTextActive: {
+    color: '#fff',
+    fontWeight: '600',
+  },
+  favoriteHeaderIcon: {
+    fontSize: 16,
+    color: '#FFC107',
+  },
+  favoriteIcon: {
+    fontSize: 18,
+    color: '#999',
+  },
+  favoriteIconActive: {
+    color: '#FFC107',
+  },
   paginationControls: {
     flexDirection: 'column',
     alignItems: 'center',
@@ -2589,6 +3852,18 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   bulkActivityButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  exportSelectedExcelButton: {
+    backgroundColor: '#4CAF50',
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 5,
+    marginRight: 10,
+  },
+  exportSelectedExcelButtonText: {
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
@@ -2742,6 +4017,12 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     elevation: 9999,
     overflow: 'hidden',
+  },
+  /** Wrapper for distributor in bulk-add modal so dropdown is not clipped and stacks above buttons */
+  bulkAddDistributorFormGroup: {
+    position: 'relative',
+    zIndex: 10000,
+    overflow: 'visible',
   },
   distributorDropdownScroll: {
     maxHeight: 300,

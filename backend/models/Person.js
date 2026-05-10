@@ -54,8 +54,9 @@ const personSchema = new mongoose.Schema({
   },
   monthIncome: {
     type: Number,
-    required: true,
-    min: 0
+    required: false,
+    min: 0,
+    default: null
   },
   maritalStatus: {
     type: String,
@@ -64,18 +65,29 @@ const personSchema = new mongoose.Schema({
   },
   liveInRenta: {
     type: Boolean,
-    required: true,
-    default: false
+    required: false,
+    default: null
   },
   hasCar: {
     type: Boolean,
-    required: true,
-    default: false
+    required: false,
+    default: null
   },
   bankNumber: {
     type: String,
-    required: true,
-    trim: true
+    required: false,
+    trim: true,
+    default: ''
+  },
+  description: {
+    type: String,
+    required: false,
+    trim: true,
+    default: null
+  },
+  favorite: {
+    type: Boolean,
+    default: false
   },
   activities: {
     type: [{
@@ -97,6 +109,11 @@ const personSchema = new mongoose.Schema({
         type: String,
         default: '',
         trim: true
+      },
+      season: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Season',
+        default: null
       }
     }],
     default: []
