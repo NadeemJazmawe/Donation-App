@@ -3,9 +3,18 @@ import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Modal, TextInput,
 import { translations } from './translations';
 import * as XLSX from 'xlsx-js-style';
 
-const EXCEL_FONT_SIZE = 16;
-const EXCEL_COL_NARROW_WCH = 10; // row number column only
-const EXCEL_COL_WIDE_WCH = 48;
+const EXCEL_FONT_SIZE = 14;
+const EXCEL_COL_NARROW_WCH = 6;
+const EXCEL_COL_KIDS_WCH = 14;
+const EXCEL_COL_WIDE_WCH = 16;
+
+/** Thin borders on all sides so adjacent cells form a clear grid in Excel. */
+const EXCEL_CELL_BORDER = {
+  top: { style: 'thin', color: { rgb: 'FFAAAAAA' } },
+  bottom: { style: 'thin', color: { rgb: 'FFAAAAAA' } },
+  left: { style: 'thin', color: { rgb: 'FFAAAAAA' } },
+  right: { style: 'thin', color: { rgb: 'FFAAAAAA' } }
+};
 
 // RTL workbook view (Excel shows sheet right-to-left; col A on the right — matches Arabic layout)
 const applyWorkbookRtl = (workbook) => {
@@ -15,29 +24,38 @@ const applyWorkbookRtl = (workbook) => {
 };
 
 /**
- * Column widths: narrow only for listed indexes (e.g. row-no column); wide for all others.
- * Cells: large font, vertical center, horizontal right + RTL reading order (numbers column centered).
+ * Column widths: narrow (row No.), kids column (14ch), or default wide.
+ * Cells: large font, vertical center, horizontal right + RTL reading order (narrow column centered).
  */
 const finalizeExcelWorksheet = (worksheet, options = {}) => {
-  const { narrowColumnIndexes = [] } = options;
+  const { narrowColumnIndexes = [], kidsColumnIndexes = [] } = options;
   if (!worksheet || !worksheet['!ref']) return;
   const range = XLSX.utils.decode_range(worksheet['!ref']);
   const numCols = range.e.c - range.s.c + 1;
 
+  const widthForColumnIndex = (c) => {
+    if (narrowColumnIndexes.includes(c)) return EXCEL_COL_NARROW_WCH;
+    if (kidsColumnIndexes.includes(c)) return EXCEL_COL_KIDS_WCH;
+    return EXCEL_COL_WIDE_WCH;
+  };
+
   worksheet['!cols'] = [];
   for (let c = 0; c < numCols; c++) {
-    const narrow = narrowColumnIndexes.includes(c);
-    worksheet['!cols'][c] = { wch: narrow ? EXCEL_COL_NARROW_WCH : EXCEL_COL_WIDE_WCH };
+    worksheet['!cols'][c] = { wch: widthForColumnIndex(c) };
   }
 
   for (let R = range.s.r; R <= range.e.r; ++R) {
     for (let C = range.s.c; C <= range.e.c; ++C) {
       const addr = XLSX.utils.encode_cell({ r: R, c: C });
-      const cell = worksheet[addr];
-      if (!cell) continue;
+      let cell = worksheet[addr];
+      if (!cell) {
+        worksheet[addr] = { t: 's', v: '' };
+        cell = worksheet[addr];
+      }
       const narrow = narrowColumnIndexes.includes(C);
       cell.s = {
         font: { sz: EXCEL_FONT_SIZE },
+        border: EXCEL_CELL_BORDER,
         alignment: {
           horizontal: narrow ? 'center' : 'right',
           vertical: 'center',
@@ -87,6 +105,25 @@ const calculateAge = (birthday) => {
     age--;
   }
   return age;
+};
+
+const parseKidsAgeBounds = (filters) => {
+  const rawMin = filters.kidsMinAge ? parseInt(filters.kidsMinAge, 10) : NaN;
+  const rawMax = filters.kidsMaxAge ? parseInt(filters.kidsMaxAge, 10) : NaN;
+  const kidsMinAge = Number.isFinite(rawMin) ? rawMin : null;
+  const kidsMaxAge = Number.isFinite(rawMax) ? rawMax : null;
+  return { kidsMinAge, kidsMaxAge };
+};
+
+const getKidsMatchingAgeRange = (person, kidsMinAge, kidsMaxAge) => {
+  if (!person.kids || person.kids.length === 0) return [];
+  return person.kids.filter((kid) => {
+    const age = calculateAge(kid.birthday);
+    if (age === null) return false;
+    const meetsMin = kidsMinAge === null || age >= kidsMinAge;
+    const meetsMax = kidsMaxAge === null || age <= kidsMaxAge;
+    return meetsMin && meetsMax;
+  });
 };
 
 // Helper function to format date for input (YYYY-MM-DD)
@@ -174,6 +211,8 @@ const App = () => {
     kidsMaxAge: '',
     minKidsNumber: ''
   });
+  /** When true with an active kids age range, table kids count and expanded list show only kids in range. */
+  const [matchKidsDisplayToAgeFilter, setMatchKidsDisplayToAgeFilter] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [activitiesModalVisible, setActivitiesModalVisible] = useState(false);
   const [editingPerson, setEditingPerson] = useState(null);
@@ -521,7 +560,10 @@ const App = () => {
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
-    finalizeExcelWorksheet(worksheet, { narrowColumnIndexes: [0] });
+    finalizeExcelWorksheet(worksheet, {
+      narrowColumnIndexes: [0],
+      kidsColumnIndexes: [2]
+    });
     const workbook = XLSX.utils.book_new();
     applyWorkbookRtl(workbook);
     XLSX.utils.book_append_sheet(workbook, worksheet, t.openActivities);
@@ -553,7 +595,10 @@ const App = () => {
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
-    finalizeExcelWorksheet(worksheet, { narrowColumnIndexes: [0] });
+    finalizeExcelWorksheet(worksheet, {
+      narrowColumnIndexes: [0],
+      kidsColumnIndexes: [2]
+    });
     const workbook = XLSX.utils.book_new();
     applyWorkbookRtl(workbook);
     XLSX.utils.book_append_sheet(workbook, worksheet, t.openActivities);
@@ -1043,10 +1088,16 @@ const App = () => {
     const selectedPersons = persons.filter(p => selectedPersonsForActivities.includes(p._id));
     if (selectedPersons.length === 0) return;
 
+    const { kidsMinAge: exportMinAge, kidsMaxAge: exportMaxAge } = parseKidsAgeBounds(filters);
+    const useMatchedKidsInExport =
+      matchKidsDisplayToAgeFilter && (exportMinAge !== null || exportMaxAge !== null);
+
     const excelData = selectedPersons.map(person => ({
       [t.name]: person.name || '',
       [t.phone]: person.phone || '',
-      [t.kids]: person.kidsNumber ?? (person.kids?.length ?? 0),
+      [t.kids]: useMatchedKidsInExport
+        ? getKidsMatchingAgeRange(person, exportMinAge, exportMaxAge).length
+        : person.kidsNumber ?? (person.kids?.length ?? 0),
       [t.income]: person.monthIncome != null && person.monthIncome !== '' ? person.monthIncome : '',
       [t.status]: t[person.maritalStatus?.toLowerCase()] || person.maritalStatus || '',
       [t.renta]: person.liveInRenta === true ? t.yes : person.liveInRenta === false ? t.no : (t.noAvailableData || 'No available data'),
@@ -1056,7 +1107,10 @@ const App = () => {
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
-    finalizeExcelWorksheet(worksheet, { narrowColumnIndexes: [] });
+    finalizeExcelWorksheet(worksheet, {
+      narrowColumnIndexes: [],
+      kidsColumnIndexes: [2]
+    });
     const workbook = XLSX.utils.book_new();
     applyWorkbookRtl(workbook);
     XLSX.utils.book_append_sheet(workbook, worksheet, t.peopleManagement || 'People');
@@ -2229,6 +2283,10 @@ const App = () => {
     return renderOpenActivitiesPage();
   }
 
+  const { kidsMinAge: tableMinAge, kidsMaxAge: tableMaxAge } = parseKidsAgeBounds(filters);
+  const useAgeMatchedKidsInTable =
+    matchKidsDisplayToAgeFilter && (tableMinAge !== null || tableMaxAge !== null);
+
   return (
     <View style={[styles.container, isRTL && styles.containerRTL]}>
       <View style={[styles.header, isRTL && styles.headerRTL]}>
@@ -2365,6 +2423,7 @@ const App = () => {
                 kidsMaxAge: '',
                 minKidsNumber: ''
               });
+              setMatchKidsDisplayToAgeFilter(false);
             }}
           >
             <Text style={styles.clearFiltersButtonText}>{t.clearAll}</Text>
@@ -2546,6 +2605,27 @@ const App = () => {
             </View>
 
             <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
+              <TouchableOpacity
+                style={[styles.filterKidsMatchRow, isRTL && styles.filterKidsMatchRowRTL]}
+                onPress={() => setMatchKidsDisplayToAgeFilter(!matchKidsDisplayToAgeFilter)}
+                activeOpacity={0.7}
+              >
+                <View
+                  style={[
+                    styles.checkbox,
+                    matchKidsDisplayToAgeFilter && styles.checkboxChecked,
+                    { marginRight: isRTL ? 0 : 10, marginLeft: isRTL ? 10 : 0 }
+                  ]}
+                >
+                  {matchKidsDisplayToAgeFilter && <Text style={styles.checkboxCheckmark}>✓</Text>}
+                </View>
+                <Text style={[styles.filterKidsMatchLabel, isRTL && styles.filterKidsMatchLabelRTL]}>
+                  {t.matchKidsDisplayToAgeFilter}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
               <View style={styles.filterGroup}>
                 <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.minNumberOfKids}</Text>
                 <TextInput
@@ -2621,7 +2701,11 @@ const App = () => {
           )}
 
           {paginatedPersons.map((person) => {
-            const hasKids = person.kids && person.kids.length > 0;
+            const matchingKidsForTable = useAgeMatchedKidsInTable
+              ? getKidsMatchingAgeRange(person, tableMinAge, tableMaxAge)
+              : [];
+            const kidsToShow = useAgeMatchedKidsInTable ? matchingKidsForTable : person.kids || [];
+            const hasKids = kidsToShow.length > 0;
             const hasDescription = person.description && String(person.description).trim();
             const hasExpandableDetails = hasKids || hasDescription;
             const isExpanded = expandedKids[person._id];
@@ -2666,7 +2750,9 @@ const App = () => {
                     <Text style={[styles.tableCellText, { flex: 1, textAlign: isRTL ? 'right' : 'left' }]}>{person.name}</Text>
                   </View>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.phone}</Text>
-                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.kidsNumber || 0}</Text>
+                  <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>
+                    {useAgeMatchedKidsInTable ? matchingKidsForTable.length : person.kidsNumber || 0}
+                  </Text>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.monthIncome != null && person.monthIncome !== '' ? person.monthIncome : ''}</Text>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{t[person.maritalStatus.toLowerCase()] || person.maritalStatus}</Text>
                   <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL]}>{person.liveInRenta === true ? t.yes : person.liveInRenta === false ? t.no : (t.noAvailableData || 'No available data')}</Text>
@@ -2692,7 +2778,7 @@ const App = () => {
                     {hasKids && (
                       <View style={styles.detailSection}>
                         <Text style={[styles.kidsLabel, isRTL && styles.kidsLabelRTL]}>{t.kidsDetails}</Text>
-                        {person.kids.map((kid, index) => {
+                        {kidsToShow.map((kid, index) => {
                           const age = calculateAge(kid.birthday);
                           return (
                             <View key={index} style={styles.kidItem}>
@@ -3737,6 +3823,23 @@ const styles = StyleSheet.create({
     color: '#333',
   },
   filterLabelRTL: {
+    textAlign: 'right',
+  },
+  filterKidsMatchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 4,
+    flex: 1,
+  },
+  filterKidsMatchRowRTL: {
+    flexDirection: 'row-reverse',
+  },
+  filterKidsMatchLabel: {
+    fontSize: 14,
+    color: '#333',
+    flex: 1,
+  },
+  filterKidsMatchLabelRTL: {
     textAlign: 'right',
   },
   filterInput: {

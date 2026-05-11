@@ -19,6 +19,8 @@ export const translations = {
     minAge: 'Min age',
     maxAge: 'Max age',
     minNumberOfKids: 'Min Number of Kids',
+    matchKidsDisplayToAgeFilter:
+      'Show kids count and details only for ages in the range above (when range is set)',
     all: 'All',
     yes: 'Yes',
     no: 'No',
@@ -185,6 +187,8 @@ export const translations = {
     minAge: 'الحد الأدنى للعمر',
     maxAge: 'الحد الأقصى للعمر',
     minNumberOfKids: 'الحد الأدنى لعدد الأطفال',
+    matchKidsDisplayToAgeFilter:
+      'عرض عدد الأطفال والتفاصيل للأعمار ضمن النطاق أعلاه فقط (عند تعيين النطاق)',
     all: 'الكل',
     yes: 'نعم',
     no: 'لا',
