@@ -171,6 +171,14 @@ const App = () => {
   const t = translations[language];
   const isRTL = language === 'ar';
   const [currentView, setCurrentView] = useState('main'); // 'main' or 'openActivities'
+
+  // Web: inherit RTL/LTR from <html> so layout and inputs mirror reliably (esp. production builds).
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const rtl = language === 'ar';
+    document.documentElement.setAttribute('dir', rtl ? 'rtl' : 'ltr');
+    document.documentElement.setAttribute('lang', rtl ? 'ar' : 'en');
+  }, [language]);
   
   const [persons, setPersons] = useState([]);
   const [distributors, setDistributors] = useState(() => {

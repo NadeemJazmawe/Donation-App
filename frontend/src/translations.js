@@ -129,6 +129,7 @@ export const translations = {
     open: 'Open',
     closed: 'Closed',
     noActivitiesFound: 'No activities found.',
+    addActivityToSelected: 'Add Activity',
     markSelectedAsCompleted: 'Mark selected as completed',
     confirmCompleteSelectedActivitiesBulk:
       'Mark {count} pending activities as completed for the selected people in the current view?',
@@ -297,6 +298,7 @@ export const translations = {
     open: 'مفتوح',
     closed: 'مغلق',
     noActivitiesFound: 'لم يتم العثور على أنشطة.',
+    addActivityToSelected: 'إضافة نشاط',
     markSelectedAsCompleted: 'إكمال المحدد',
     confirmCompleteSelectedActivitiesBulk:
       'وضع علامة مكتمل على {count} نشاط معلق للأشخاص المحددين في العرض الحالي؟',
