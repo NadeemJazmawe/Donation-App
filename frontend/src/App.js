@@ -72,6 +72,10 @@ const preparePersonBody = (person) => {
   };
 };
 
+/** Open Activities table: one checkbox per activity row (personId + index in activities[]). */
+const openActivityRowKey = (personId, activityIndex) =>
+  `${String(personId)}:${String(activityIndex)}`;
+
 // Helper function to calculate age
 const calculateAge = (birthday) => {
   if (!birthday) return null;
@@ -174,7 +178,8 @@ const App = () => {
   const [activitiesModalVisible, setActivitiesModalVisible] = useState(false);
   const [editingPerson, setEditingPerson] = useState(null);
   const [selectedPersonForActivities, setSelectedPersonForActivities] = useState(null);
-  const [selectedPersonsForActivities, setSelectedPersonsForActivities] = useState([]); // Track selected persons for bulk activity addition
+  const [selectedPersonsForActivities, setSelectedPersonsForActivities] = useState([]); // Main page: selected persons for bulk activity addition
+  const [selectedOpenActivityKeys, setSelectedOpenActivityKeys] = useState([]); // Open Activities: keys "personId:activityIndex"
   const [bulkAddActivityModalVisible, setBulkAddActivityModalVisible] = useState(false);
   const [bulkAddActivityDescription, setBulkAddActivityDescription] = useState('');
   const [bulkAddActivityDistributor, setBulkAddActivityDistributor] = useState(''); // distributor name or ''
@@ -309,6 +314,18 @@ const App = () => {
       setPaginatedPersons(filteredPersons.slice(startIndex, endIndex));
     }
   }, [filteredPersons, itemsPerPage, currentPage]);
+
+  const getBulkAddTargetPersonIds = () => {
+    if (currentView === 'openActivities') {
+      const ids = new Set();
+      selectedOpenActivityKeys.forEach(key => {
+        const i = key.lastIndexOf(':');
+        if (i > 0) ids.add(key.slice(0, i));
+      });
+      return [...ids];
+    }
+    return [...selectedPersonsForActivities];
+  };
 
   const fetchPersons = async () => {
     try {
@@ -515,11 +532,12 @@ const App = () => {
 
   // Selected rows on Open Activities page: same columns as exportToExcel, only checked people, still respecting filters
   const exportSelectedOpenActivitiesToExcel = () => {
-    if (selectedPersonsForActivities.length === 0) return;
-    const selectedSet = new Set(selectedPersonsForActivities.map(id => String(id)));
-    const filteredActivities = getFilteredActivities().filter(a =>
-      a.personId && selectedSet.has(String(a.personId))
-    );
+    if (selectedOpenActivityKeys.length === 0) return;
+    const keySet = new Set(selectedOpenActivityKeys);
+    const filteredActivities = getFilteredActivities().filter(a => {
+      if (a.activityIndex === undefined || a.activityIndex === null) return false;
+      return keySet.has(openActivityRowKey(a.personId, a.activityIndex));
+    });
     if (filteredActivities.length === 0) {
       alert(t.noActivitiesFound);
       return;
@@ -541,6 +559,73 @@ const App = () => {
     XLSX.utils.book_append_sheet(workbook, worksheet, t.openActivities);
     const fileName = `Selected_Open_Activities_${new Date().toISOString().split('T')[0]}.xlsx`;
     XLSX.writeFile(workbook, fileName);
+  };
+
+  // Pending activity rows for selected people in the current Open Activities filters (same scope as export selected)
+  const getSelectedPendingActivityRowsInView = () => {
+    if (selectedOpenActivityKeys.length === 0) return [];
+    const keySet = new Set(selectedOpenActivityKeys);
+    return getFilteredActivities().filter(a => {
+      if (a.activityIndex === undefined || a.activityIndex === null) return false;
+      if (!keySet.has(openActivityRowKey(a.personId, a.activityIndex))) return false;
+      if (a.activityStatus === 'none' || !a.description) return false;
+      if (!(a.activityStatus === 'pending' || !a.activityStatus)) return false;
+      return true;
+    });
+  };
+
+  const completeSelectedPendingActivitiesInView = async () => {
+    const pendingRows = getSelectedPendingActivityRowsInView();
+    if (pendingRows.length === 0) {
+      alert(t.noPendingSelectedForBulk);
+      return;
+    }
+    const confirmMsg = (t.confirmCompleteSelectedActivitiesBulk || '').replace(
+      '{count}',
+      String(pendingRows.length)
+    );
+    if (!window.confirm(confirmMsg)) return;
+
+    const byPerson = new Map();
+    for (const row of pendingRows) {
+      const pid = String(row.personId);
+      if (!byPerson.has(pid)) byPerson.set(pid, new Set());
+      byPerson.get(pid).add(row.activityIndex);
+    }
+
+    try {
+      const requests = [];
+      for (const [personIdStr, indexSet] of byPerson.entries()) {
+        const person = persons.find(p => String(p._id) === personIdStr);
+        if (!person || !person.activities) continue;
+        const updatedActivities = person.activities.map((act, idx) => {
+          if (indexSet.has(idx) && (act.status === 'pending' || !act.status)) {
+            return { ...act, status: 'completed' };
+          }
+          return act;
+        });
+        requests.push(
+          fetch(`${API_URL}/${person._id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(
+              preparePersonBody({
+                ...person,
+                activities: updatedActivities
+              })
+            )
+          }).then(res => {
+            if (!res.ok) throw new Error(t.errorUpdatingActivity);
+          })
+        );
+      }
+      await Promise.all(requests);
+      fetchPersons();
+      setSelectedOpenActivityKeys([]);
+    } catch (error) {
+      console.error('Error bulk-completing activities:', error);
+      alert(t.errorUpdatingActivity);
+    }
   };
 
   // Toggle activity status (close/open activity)
@@ -886,7 +971,9 @@ const App = () => {
 
   // Add activity to selected persons (with optional distributor)
   const addActivityToSelected = async (activityDescription, distributorName = '', seasonId = '') => {
-    if (!activityDescription.trim() || selectedPersonsForActivities.length === 0) {
+    const targetPersonIds = getBulkAddTargetPersonIds();
+    const peopleCount = targetPersonIds.length;
+    if (!activityDescription.trim() || peopleCount === 0) {
       alert(t.selectPeopleFirst || 'Please select at least one person first');
       return;
     }
@@ -900,8 +987,8 @@ const App = () => {
     }
 
     try {
-      const promises = selectedPersonsForActivities.map(async (personId) => {
-        const person = persons.find(p => p._id === personId);
+      const promises = targetPersonIds.map(async (personIdStr) => {
+        const person = persons.find(p => String(p._id) === String(personIdStr));
         if (!person) return;
 
         const updatedActivities = [
@@ -915,7 +1002,7 @@ const App = () => {
           }
         ];
 
-        const response = await fetch(`${API_URL}/${personId}`, {
+        const response = await fetch(`${API_URL}/${person._id}`, {
           method: 'PUT',
           headers: {
             'Content-Type': 'application/json',
@@ -932,14 +1019,18 @@ const App = () => {
       });
 
       await Promise.all(promises);
-      setSelectedPersonsForActivities([]);
+      if (currentView === 'openActivities') {
+        setSelectedOpenActivityKeys([]);
+      } else {
+        setSelectedPersonsForActivities([]);
+      }
       setBulkAddActivityModalVisible(false);
       setBulkAddActivityDescription('');
       setBulkAddActivityDistributor('');
       setBulkAddActivitySeasonId(seasons[0]?._id || '');
       setBulkAddSeasonDropdownOpen(false);
       fetchPersons(); // Refresh the list
-      alert(t.activityAddedToSelected || `Activity added to ${selectedPersonsForActivities.length} person(s)`);
+      alert(t.activityAddedToSelected || `Activity added to ${peopleCount} person(s)`);
     } catch (error) {
       console.error('Error adding activity to selected persons:', error);
       alert(t.errorAddingActivity);
@@ -1191,7 +1282,7 @@ const App = () => {
       <View style={styles.modalOverlay}>
         <View style={[styles.modalContent, isRTL && styles.modalContentRTL]}>
           <Text style={styles.modalTitle}>
-            {t.addActivityToSelected || 'Add Activity'} ({selectedPersonsForActivities.length})
+            {t.addActivityToSelected || 'Add Activity'} ({getBulkAddTargetPersonIds().length})
           </Text>
           <View style={[styles.form, styles.bulkAddForm]}>
             <View style={styles.formGroup}>
@@ -1332,26 +1423,39 @@ const App = () => {
   const renderOpenActivitiesPage = () => {
     const filteredActivities = getFilteredActivities();
     const activityGroups = groupActivitiesBySeason(filteredActivities);
-    const visiblePersonIds = [...new Set(filteredActivities.map(a => a.personId).filter(Boolean))];
-    const allVisiblePeopleSelected =
-      visiblePersonIds.length > 0 &&
-      visiblePersonIds.every(pid =>
-        selectedPersonsForActivities.some(sid => String(sid) === String(pid))
-      );
+    const selectableRowKeys = [
+      ...new Set(
+        filteredActivities
+          .filter(a => a.activityIndex !== undefined && a.activityIndex !== null)
+          .map(a => openActivityRowKey(a.personId, a.activityIndex))
+      )
+    ];
+    const selectableRowKeysSet = new Set(selectableRowKeys);
+    const selectedKeySet = new Set(selectedOpenActivityKeys);
+    const allVisibleActivityRowsSelected =
+      selectableRowKeys.length > 0 && selectableRowKeys.every(k => selectedKeySet.has(k));
 
     return (
       <View style={[styles.container, isRTL && styles.containerRTL]}>
         <View style={[styles.header, isRTL && styles.headerRTL]}>
           <Text style={styles.title}>{t.openActivities}</Text>
           <View style={styles.headerRight}>
-            {selectedPersonsForActivities.length > 0 && (
+            {selectedOpenActivityKeys.length > 0 && (
               <>
                 <TouchableOpacity
                   style={styles.exportSelectedExcelButton}
                   onPress={exportSelectedOpenActivitiesToExcel}
                 >
                   <Text style={styles.exportSelectedExcelButtonText}>
-                    {t.exportSelectedToExcel || 'Export to Excel'} ({selectedPersonsForActivities.length})
+                    {t.exportSelectedToExcel || 'Export to Excel'} ({selectedOpenActivityKeys.length})
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.completeSelectedBulkButton}
+                  onPress={completeSelectedPendingActivitiesInView}
+                >
+                  <Text style={styles.completeSelectedBulkButtonText}>
+                    {t.markSelectedAsCompleted} ({getSelectedPendingActivityRowsInView().length})
                   </Text>
                 </TouchableOpacity>
                 <TouchableOpacity
@@ -1364,7 +1468,7 @@ const App = () => {
                   }}
                 >
                   <Text style={styles.bulkActivityButtonText}>
-                    {t.addActivityToSelected || 'Add Activity'} ({selectedPersonsForActivities.length})
+                    {t.addActivityToSelected || 'Add Activity'} ({getBulkAddTargetPersonIds().length})
                   </Text>
                 </TouchableOpacity>
               </>
@@ -1391,6 +1495,7 @@ const App = () => {
               style={styles.navButton}
               onPress={() => {
                 setSelectedPersonsForActivities([]);
+                setSelectedOpenActivityKeys([]);
                 setCurrentView('main');
               }}
             >
@@ -1726,28 +1831,24 @@ const App = () => {
                 <TouchableOpacity
                   style={[
                     styles.checkbox,
-                    allVisiblePeopleSelected && visiblePersonIds.length > 0 && styles.checkboxChecked
+                    allVisibleActivityRowsSelected && selectableRowKeys.length > 0 && styles.checkboxChecked
                   ]}
                   onPress={() => {
-                    if (allVisiblePeopleSelected) {
-                      setSelectedPersonsForActivities(prev =>
-                        prev.filter(id => !visiblePersonIds.some(vid => String(vid) === String(id)))
+                    if (allVisibleActivityRowsSelected) {
+                      setSelectedOpenActivityKeys(prev =>
+                        prev.filter(k => !selectableRowKeysSet.has(k))
                       );
                     } else {
-                      setSelectedPersonsForActivities(prev => {
-                        const next = [...prev];
-                        visiblePersonIds.forEach(vid => {
-                          if (!next.some(id => String(id) === String(vid))) {
-                            next.push(vid);
-                          }
-                        });
-                        return next;
+                      setSelectedOpenActivityKeys(prev => {
+                        const next = new Set(prev);
+                        selectableRowKeys.forEach(k => next.add(k));
+                        return [...next];
                       });
                     }
                   }}
-                  disabled={visiblePersonIds.length === 0}
+                  disabled={selectableRowKeys.length === 0}
                 >
-                  {allVisiblePeopleSelected && visiblePersonIds.length > 0 && (
+                  {allVisibleActivityRowsSelected && selectableRowKeys.length > 0 && (
                     <Text style={styles.checkboxCheckmark}>✓</Text>
                   )}
                 </TouchableOpacity>
@@ -1779,25 +1880,33 @@ const App = () => {
                 const isDistOpen = openDropdowns[distDropdownKey];
                 const isSeasonOpen = openDropdowns[seasonDropdownKey];
                 const isDropdownOpen = isDistOpen || isSeasonOpen;
-                const isPersonSelected = selectedPersonsForActivities.some(
-                  sid => String(sid) === String(activity.personId)
-                );
+                const rowKey =
+                  hasNoActivity || activity.activityIndex === undefined || activity.activityIndex === null
+                    ? null
+                    : openActivityRowKey(activity.personId, activity.activityIndex);
+                const isActivityRowSelected = rowKey != null && selectedKeySet.has(rowKey);
                 return (
                   <View key={`${activity.personId}-${activity.date}-${group.key}-${index}`} style={[styles.tableRow, isRTL && styles.tableRowRTL, { zIndex: isDropdownOpen ? 99999999 : 1 }]}>
                     <View style={[styles.tableCell, checkboxHeaderCellStyle]}>
                       <TouchableOpacity
-                        style={[styles.checkbox, isPersonSelected && styles.checkboxChecked]}
+                        style={[
+                          styles.checkbox,
+                          isActivityRowSelected && styles.checkboxChecked,
+                          rowKey == null && { opacity: 0.35 }
+                        ]}
+                        disabled={rowKey == null}
                         onPress={() => {
-                          if (isPersonSelected) {
-                            setSelectedPersonsForActivities(prev =>
-                              prev.filter(id => String(id) !== String(activity.personId))
-                            );
+                          if (rowKey == null) return;
+                          if (isActivityRowSelected) {
+                            setSelectedOpenActivityKeys(prev => prev.filter(k => k !== rowKey));
                           } else {
-                            setSelectedPersonsForActivities(prev => [...prev, activity.personId]);
+                            setSelectedOpenActivityKeys(prev =>
+                              prev.includes(rowKey) ? prev : [...prev, rowKey]
+                            );
                           }
                         }}
                       >
-                        {isPersonSelected && <Text style={styles.checkboxCheckmark}>✓</Text>}
+                        {isActivityRowSelected && <Text style={styles.checkboxCheckmark}>✓</Text>}
                       </TouchableOpacity>
                     </View>
                     <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL, { flex: 2 }]}>
@@ -2156,6 +2265,7 @@ const App = () => {
               fetchPersons();
               fetchSeasons();
               setSelectedPersonsForActivities([]);
+              setSelectedOpenActivityKeys([]);
               setCurrentView('openActivities');
             }}
           >
@@ -2176,23 +2286,25 @@ const App = () => {
       {renderBulkAddActivityModal()}
 
       {/* Search Bar */}
-      <View style={[styles.searchContainer, isRTL && styles.searchContainerRTL]}>
-        <TextInput
-          style={[styles.searchInput, isRTL && styles.searchInputRTL]}
-          placeholder={t.searchPlaceholder}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          placeholderTextColor="#999"
-          textAlign={isRTL ? 'right' : 'left'}
-        />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity 
-            style={styles.clearSearchButton}
-            onPress={() => setSearchQuery('')}
-          >
-            <Text style={styles.clearSearchButtonText}>✕</Text>
-          </TouchableOpacity>
-        )}
+      <View style={styles.searchContainer}>
+        <View style={[styles.searchFieldWrapper, isRTL && styles.searchFieldWrapperRTL]}>
+          <TextInput
+            style={styles.searchInput}
+            placeholder={t.searchPlaceholder}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholderTextColor="#999"
+            textAlign={isRTL ? 'right' : 'left'}
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity
+              style={styles.clearSearchButton}
+              onPress={() => setSearchQuery('')}
+            >
+              <Text style={styles.clearSearchButtonText}>✕</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
       {/* Favorites Filter */}
@@ -3515,34 +3627,37 @@ const styles = StyleSheet.create({
     padding: 15,
     borderBottomWidth: 1,
     borderBottomColor: '#e0e0e0',
+  },
+  searchFieldWrapper: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 8,
+    backgroundColor: '#f8f9fa',
+    minHeight: 48,
+    paddingHorizontal: 4,
   },
-  searchContainerRTL: {
+  searchFieldWrapperRTL: {
     flexDirection: 'row-reverse',
   },
   searchInput: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 8,
-    padding: 12,
+    borderWidth: 0,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
     fontSize: 16,
-    backgroundColor: '#f8f9fa',
-    paddingRight: 40,
-  },
-  searchInputRTL: {
-    paddingRight: 12,
-    paddingLeft: 40,
+    backgroundColor: 'transparent',
+    minHeight: 44,
   },
   clearSearchButton: {
-    position: 'absolute',
-    right: 25,
-    padding: 8,
+    flexShrink: 0,
+    width: 32,
+    height: 32,
+    marginHorizontal: 4,
     backgroundColor: '#e0e0e0',
-    borderRadius: 12,
-    width: 24,
-    height: 24,
+    borderRadius: 16,
     justifyContent: 'center',
     alignItems: 'center',
   },
@@ -3852,6 +3967,18 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   bulkActivityButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  completeSelectedBulkButton: {
+    backgroundColor: '#1976D2',
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 5,
+    marginRight: 10,
+  },
+  completeSelectedBulkButtonText: {
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
