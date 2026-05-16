@@ -5,7 +5,8 @@ import * as XLSX from 'xlsx-js-style';
 
 const EXCEL_FONT_SIZE = 14;
 const EXCEL_COL_NARROW_WCH = 6;
-const EXCEL_COL_KIDS_WCH = 14;
+const EXCEL_COL_NAME_WCH = 22;
+const EXCEL_COL_KIDS_WCH = 7;
 const EXCEL_COL_WIDE_WCH = 16;
 
 /** Thin borders on all sides so adjacent cells form a clear grid in Excel. */
@@ -24,17 +25,18 @@ const applyWorkbookRtl = (workbook) => {
 };
 
 /**
- * Column widths: narrow (row No.), kids column (14ch), or default wide.
+ * Column widths: narrow (row No.), name (22ch), kids (7ch), or default wide.
  * Cells: large font, vertical center, horizontal right + RTL reading order (narrow column centered).
  */
 const finalizeExcelWorksheet = (worksheet, options = {}) => {
-  const { narrowColumnIndexes = [], kidsColumnIndexes = [] } = options;
+  const { narrowColumnIndexes = [], nameColumnIndexes = [], kidsColumnIndexes = [] } = options;
   if (!worksheet || !worksheet['!ref']) return;
   const range = XLSX.utils.decode_range(worksheet['!ref']);
   const numCols = range.e.c - range.s.c + 1;
 
   const widthForColumnIndex = (c) => {
     if (narrowColumnIndexes.includes(c)) return EXCEL_COL_NARROW_WCH;
+    if (nameColumnIndexes.includes(c)) return EXCEL_COL_NAME_WCH;
     if (kidsColumnIndexes.includes(c)) return EXCEL_COL_KIDS_WCH;
     return EXCEL_COL_WIDE_WCH;
   };
@@ -554,7 +556,7 @@ const App = () => {
     return groups;
   };
 
-  // Export filtered activities to Excel (No., Name, Kids number, Activity, Distributor only)
+  // Export filtered activities to Excel (No., Name, Kids, Activity, Distributor, Notes)
   const exportToExcel = () => {
     const filteredActivities = getFilteredActivities();
 
@@ -562,14 +564,15 @@ const App = () => {
       [t.rowNo]: index + 1,
       [t.name]: activity.personName,
       [t.kids]: activity.personKidsNumber,
-      [t.season]: activity.seasonName || t.uncategorizedSeason,
       [t.activity]: activity.description || '-',
-      [t.distributor]: activity.distributor || '-'
+      [t.distributor]: activity.distributor || '-',
+      [t.notes]: ''
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
     finalizeExcelWorksheet(worksheet, {
       narrowColumnIndexes: [0],
+      nameColumnIndexes: [1],
       kidsColumnIndexes: [2]
     });
     const workbook = XLSX.utils.book_new();
@@ -597,14 +600,15 @@ const App = () => {
       [t.rowNo]: index + 1,
       [t.name]: activity.personName,
       [t.kids]: activity.personKidsNumber,
-      [t.season]: activity.seasonName || t.uncategorizedSeason,
       [t.activity]: activity.description || '-',
-      [t.distributor]: activity.distributor || '-'
+      [t.distributor]: activity.distributor || '-',
+      [t.notes]: ''
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
     finalizeExcelWorksheet(worksheet, {
       narrowColumnIndexes: [0],
+      nameColumnIndexes: [1],
       kidsColumnIndexes: [2]
     });
     const workbook = XLSX.utils.book_new();
@@ -1117,6 +1121,7 @@ const App = () => {
     const worksheet = XLSX.utils.json_to_sheet(excelData);
     finalizeExcelWorksheet(worksheet, {
       narrowColumnIndexes: [],
+      nameColumnIndexes: [0],
       kidsColumnIndexes: [2]
     });
     const workbook = XLSX.utils.book_new();
