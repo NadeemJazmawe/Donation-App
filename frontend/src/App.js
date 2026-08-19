@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Modal, TextInput, Switch } from 'react-native';
 import { translations } from './translations';
 import * as XLSX from 'xlsx-js-style';
@@ -8,6 +9,9 @@ const EXCEL_COL_NARROW_WCH = 6;
 const EXCEL_COL_NAME_WCH = 22;
 const EXCEL_COL_KIDS_WCH = 7;
 const EXCEL_COL_WIDE_WCH = 16;
+const DROPDOWN_MAX_HEIGHT = 300;
+const DROPDOWN_GAP = 4;
+const DROPDOWN_VIEWPORT_PADDING = 8;
 
 /** Thin borders on all sides so adjacent cells form a clear grid in Excel. */
 const EXCEL_CELL_BORDER = {
@@ -192,12 +196,15 @@ const App = () => {
   const [newDistributorName, setNewDistributorName] = useState('');
   const [newDistributorPhone, setNewDistributorPhone] = useState('');
   const [openDropdowns, setOpenDropdowns] = useState({}); // Track which dropdowns are open
+  const dropdownOpenedAtRef = useRef(0);
   const [filteredPersons, setFilteredPersons] = useState([]);
   const [openActivitiesFilters, setOpenActivitiesFilters] = useState({
     distributor: '',
     season: '', // '' = all, '__NO_SEASON__', or season _id string
     activityStatus: 'open', // 'all', 'open', 'closed'
     activityName: '',
+    kidsMinAge: '',
+    kidsMaxAge: '',
     dateFromDay: '',
     dateFromMonth: '',
     dateFromYear: '',
@@ -232,14 +239,12 @@ const App = () => {
   const [bulkAddActivityModalVisible, setBulkAddActivityModalVisible] = useState(false);
   const [bulkAddActivityDescription, setBulkAddActivityDescription] = useState('');
   const [bulkAddActivityDistributor, setBulkAddActivityDistributor] = useState(''); // distributor name or ''
-  const [bulkAddDistributorDropdownOpen, setBulkAddDistributorDropdownOpen] = useState(false);
   const [bulkAddActivitySeasonId, setBulkAddActivitySeasonId] = useState('');
-  const [bulkAddSeasonDropdownOpen, setBulkAddSeasonDropdownOpen] = useState(false);
+  const [dropdownAnchor, setDropdownAnchor] = useState(null);
   const [seasons, setSeasons] = useState([]);
   const [seasonModalVisible, setSeasonModalVisible] = useState(false);
   const [newSeasonName, setNewSeasonName] = useState('');
   const [newActivitySeasonId, setNewActivitySeasonId] = useState('');
-  const [activitySeasonDropdownOpen, setActivitySeasonDropdownOpen] = useState(false);
   const [expandedKids, setExpandedKids] = useState({}); // Track which persons have kids expanded
   const [newActivity, setNewActivity] = useState('');
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
@@ -254,6 +259,118 @@ const App = () => {
     bankNumber: '',
     description: ''
   });
+
+  const closeAllDropdowns = () => {
+    setOpenDropdowns({});
+    setDropdownAnchor(null);
+  };
+
+  const isDropdownOpen = (key) => !!openDropdowns[key];
+
+  const toggleDropdown = (key, event) => {
+    if (openDropdowns[key]) {
+      closeAllDropdowns();
+      return;
+    }
+    const el = event?.currentTarget;
+    if (!el?.getBoundingClientRect || typeof window === 'undefined') {
+      setDropdownAnchor({ key, top: 0, left: 0, width: 200, maxHeight: DROPDOWN_MAX_HEIGHT });
+      dropdownOpenedAtRef.current = Date.now();
+      setOpenDropdowns({ [key]: true });
+      return;
+    }
+
+    const rect = el.getBoundingClientRect();
+    const viewportHeight = window.innerHeight;
+    const viewportWidth = window.innerWidth;
+    const maxAllowedWidth = viewportWidth - DROPDOWN_VIEWPORT_PADDING * 2;
+    let width = Math.min(Math.max(rect.width, 120), maxAllowedWidth);
+
+    // Keep menu aligned with the trigger; shift left only as much as needed to stay on screen.
+    let left = rect.left;
+    if (left + width > viewportWidth - DROPDOWN_VIEWPORT_PADDING) {
+      left = rect.right - width;
+    }
+    if (left < DROPDOWN_VIEWPORT_PADDING) {
+      left = DROPDOWN_VIEWPORT_PADDING;
+      width = Math.min(width, maxAllowedWidth);
+    }
+
+    const spaceBelow = viewportHeight - rect.bottom - DROPDOWN_VIEWPORT_PADDING;
+    const spaceAbove = rect.top - DROPDOWN_VIEWPORT_PADDING;
+    const openUpward = spaceBelow < 180 && spaceAbove > spaceBelow;
+
+    let maxHeight;
+    const anchor = { key, left, width, openUpward };
+
+    if (openUpward) {
+      maxHeight = Math.min(DROPDOWN_MAX_HEIGHT, spaceAbove - DROPDOWN_GAP);
+      maxHeight = Math.max(80, maxHeight);
+      anchor.maxHeight = maxHeight;
+      anchor.bottom = viewportHeight - rect.top + DROPDOWN_GAP;
+    } else {
+      maxHeight = Math.min(DROPDOWN_MAX_HEIGHT, spaceBelow - DROPDOWN_GAP);
+      maxHeight = Math.max(80, maxHeight);
+      let top = rect.bottom + DROPDOWN_GAP;
+      if (top + maxHeight > viewportHeight - DROPDOWN_VIEWPORT_PADDING) {
+        maxHeight = Math.max(80, viewportHeight - DROPDOWN_VIEWPORT_PADDING - top);
+      }
+      anchor.maxHeight = maxHeight;
+      anchor.top = top;
+    }
+
+    setDropdownAnchor(anchor);
+    dropdownOpenedAtRef.current = Date.now();
+    setOpenDropdowns({ [key]: true });
+  };
+
+  const handleScrollCloseDropdowns = () => {
+    if (Date.now() - dropdownOpenedAtRef.current < 200) return;
+    closeAllDropdowns();
+  };
+
+  const renderAnchoredDropdown = (key, renderOptions) => {
+    if (!isDropdownOpen(key) || !dropdownAnchor || dropdownAnchor.key !== key) {
+      return null;
+    }
+    const menu = (
+      <>
+        <TouchableOpacity
+          style={styles.dropdownBackdrop}
+          activeOpacity={1}
+          onPress={closeAllDropdowns}
+        />
+        <View
+          style={[
+            styles.distributorDropdownMenu,
+            {
+              left: dropdownAnchor.left,
+              width: dropdownAnchor.width,
+              maxHeight: dropdownAnchor.maxHeight,
+              ...(dropdownAnchor.openUpward
+                ? {
+                    bottom: dropdownAnchor.bottom,
+                    height: dropdownAnchor.maxHeight,
+                    justifyContent: 'flex-end'
+                  }
+                : { top: dropdownAnchor.top })
+            }
+          ]}
+        >
+          <ScrollView
+            style={[styles.distributorDropdownScroll, { maxHeight: dropdownAnchor.maxHeight }]}
+            nestedScrollEnabled={true}
+          >
+            {renderOptions()}
+          </ScrollView>
+        </View>
+      </>
+    );
+    if (typeof document !== 'undefined') {
+      return createPortal(menu, document.body);
+    }
+    return menu;
+  };
 
   useEffect(() => {
     fetchPersons();
@@ -502,6 +619,15 @@ const App = () => {
           activity.seasonId && String(activity.seasonId) === String(sid)
         );
       }
+    }
+
+    const { kidsMinAge, kidsMaxAge } = parseKidsAgeBounds(openActivitiesFilters);
+    if (kidsMinAge !== null || kidsMaxAge !== null) {
+      activities = activities.filter((activity) => {
+        const person = persons.find(p => String(p._id) === String(activity.personId));
+        if (!person) return false;
+        return getKidsMatchingAgeRange(person, kidsMinAge, kidsMaxAge).length > 0;
+      });
     }
 
     // Timeline: activity date between from/to (day/month/year), inclusive — same rules as kid birthday fields
@@ -964,7 +1090,7 @@ const App = () => {
     setSelectedPersonForActivities(person);
     setNewActivity('');
     setNewActivitySeasonId(seasons[0]?._id || '');
-    setActivitySeasonDropdownOpen(false);
+    closeAllDropdowns();
     setActivitiesModalVisible(true);
   };
 
@@ -973,7 +1099,7 @@ const App = () => {
     setActivitiesModalVisible(false);
     setSelectedPersonForActivities(null);
     setNewActivity('');
-    setActivitySeasonDropdownOpen(false);
+    closeAllDropdowns();
   };
 
   // Add new activity
@@ -1085,7 +1211,7 @@ const App = () => {
       setBulkAddActivityDescription('');
       setBulkAddActivityDistributor('');
       setBulkAddActivitySeasonId(seasons[0]?._id || '');
-      setBulkAddSeasonDropdownOpen(false);
+      closeAllDropdowns();
       fetchPersons(); // Refresh the list
       alert(t.activityAddedToSelected || `Activity added to ${peopleCount} person(s)`);
     } catch (error) {
@@ -1342,8 +1468,7 @@ const App = () => {
         setBulkAddActivityModalVisible(false);
         setBulkAddActivityDescription('');
         setBulkAddActivityDistributor('');
-        setBulkAddDistributorDropdownOpen(false);
-        setBulkAddSeasonDropdownOpen(false);
+        closeAllDropdowns();
       }}
     >
       <View style={styles.modalOverlay}>
@@ -1365,25 +1490,25 @@ const App = () => {
             </View>
             <View style={[styles.formGroup, styles.bulkAddDistributorFormGroup]}>
               <Text style={styles.label}>{t.distributor}</Text>
-              <TouchableOpacity
-                style={styles.distributorSelectButton}
-                onPress={() => setBulkAddDistributorDropdownOpen(!bulkAddDistributorDropdownOpen)}
-              >
-                <Text style={styles.distributorSelectButtonText}>
-                  {bulkAddActivityDistributor || t.selectDistributor}
-                </Text>
-                <Text style={styles.distributorSelectArrow}>
-                  {bulkAddDistributorDropdownOpen ? '▲' : '▼'}
-                </Text>
-              </TouchableOpacity>
-              {bulkAddDistributorDropdownOpen && (
-                <View style={styles.distributorDropdown}>
-                  <ScrollView style={styles.distributorDropdownScroll} nestedScrollEnabled={true}>
+              <View style={styles.distributorSelector}>
+                <TouchableOpacity
+                  style={styles.distributorSelectButton}
+                  onPress={(e) => toggleDropdown('bulk-distributor', e)}
+                >
+                  <Text style={styles.distributorSelectButtonText}>
+                    {bulkAddActivityDistributor || t.selectDistributor}
+                  </Text>
+                  <Text style={styles.distributorSelectArrow}>
+                    {isDropdownOpen('bulk-distributor') ? '▲' : '▼'}
+                  </Text>
+                </TouchableOpacity>
+                {renderAnchoredDropdown('bulk-distributor', () => (
+                  <>
                     <TouchableOpacity
                       style={styles.distributorOption}
                       onPress={() => {
                         setBulkAddActivityDistributor('');
-                        setBulkAddDistributorDropdownOpen(false);
+                        closeAllDropdowns();
                       }}
                     >
                       <Text style={styles.distributorOptionText}>{t.noDistributor}</Text>
@@ -1394,7 +1519,7 @@ const App = () => {
                         style={styles.distributorOption}
                         onPress={() => {
                           setBulkAddActivityDistributor(distributor.name);
-                          setBulkAddDistributorDropdownOpen(false);
+                          closeAllDropdowns();
                         }}
                       >
                         <Text style={styles.distributorOptionText}>
@@ -1402,43 +1527,43 @@ const App = () => {
                         </Text>
                       </TouchableOpacity>
                     ))}
-                  </ScrollView>
-                </View>
-              )}
+                  </>
+                ))}
+              </View>
             </View>
             <View style={[styles.formGroup, styles.bulkAddDistributorFormGroup]}>
               <Text style={styles.label}>{t.selectSeason}</Text>
-              <TouchableOpacity
-                style={styles.distributorSelectButton}
-                onPress={() => setBulkAddSeasonDropdownOpen(!bulkAddSeasonDropdownOpen)}
-              >
-                <Text style={styles.distributorSelectButtonText}>
-                  {bulkAddActivitySeasonId && seasons.find(s => String(s._id) === String(bulkAddActivitySeasonId))
-                    ? seasons.find(s => String(s._id) === String(bulkAddActivitySeasonId)).name
-                    : t.selectSeason}
-                </Text>
-                <Text style={styles.distributorSelectArrow}>
-                  {bulkAddSeasonDropdownOpen ? '▲' : '▼'}
-                </Text>
-              </TouchableOpacity>
-              {bulkAddSeasonDropdownOpen && (
-                <View style={styles.distributorDropdown}>
-                  <ScrollView style={styles.distributorDropdownScroll} nestedScrollEnabled={true}>
+              <View style={styles.distributorSelector}>
+                <TouchableOpacity
+                  style={styles.distributorSelectButton}
+                  onPress={(e) => toggleDropdown('bulk-season', e)}
+                >
+                  <Text style={styles.distributorSelectButtonText}>
+                    {bulkAddActivitySeasonId && seasons.find(s => String(s._id) === String(bulkAddActivitySeasonId))
+                      ? seasons.find(s => String(s._id) === String(bulkAddActivitySeasonId)).name
+                      : t.selectSeason}
+                  </Text>
+                  <Text style={styles.distributorSelectArrow}>
+                    {isDropdownOpen('bulk-season') ? '▲' : '▼'}
+                  </Text>
+                </TouchableOpacity>
+                {renderAnchoredDropdown('bulk-season', () => (
+                  <>
                     {seasons.map(season => (
                       <TouchableOpacity
                         key={season._id}
                         style={styles.distributorOption}
                         onPress={() => {
                           setBulkAddActivitySeasonId(season._id);
-                          setBulkAddSeasonDropdownOpen(false);
+                          closeAllDropdowns();
                         }}
                       >
                         <Text style={styles.distributorOptionText}>{season.name}</Text>
                       </TouchableOpacity>
                     ))}
-                  </ScrollView>
-                </View>
-              )}
+                  </>
+                ))}
+              </View>
             </View>
             <View style={[styles.formGroup, { flexDirection: isRTL ? 'row-reverse' : 'row', gap: 10, marginTop: 16 }]}>
               <TouchableOpacity
@@ -1447,8 +1572,7 @@ const App = () => {
                   setBulkAddActivityModalVisible(false);
                   setBulkAddActivityDescription('');
                   setBulkAddActivityDistributor('');
-                  setBulkAddDistributorDropdownOpen(false);
-                  setBulkAddSeasonDropdownOpen(false);
+                  closeAllDropdowns();
                 }}
               >
                 <Text style={styles.cancelButtonText}>{t.close}</Text>
@@ -1577,6 +1701,10 @@ const App = () => {
           </View>
         </View>
 
+        <ScrollView 
+          style={styles.scrollView}
+          onScrollBeginDrag={handleScrollCloseDropdowns}
+        >
         {/* Filters Section */}
         <View style={styles.filtersContainer}>
           <TouchableOpacity 
@@ -1594,6 +1722,8 @@ const App = () => {
                   season: '',
                   activityStatus: 'open',
                   activityName: '',
+                  kidsMinAge: '',
+                  kidsMaxAge: '',
                   dateFromDay: '',
                   dateFromMonth: '',
                   dateFromYear: '',
@@ -1609,19 +1739,13 @@ const App = () => {
 
           {showOpenActivitiesFilters && (
             <View style={[styles.filtersContent, isRTL && styles.filtersContentRTL]}>
-              <View style={[styles.filterRow, isRTL && styles.filterRowRTL, { zIndex: 9999999 }]}>
-                <View style={[styles.filterGroup, { zIndex: 9999999 }]}>
+              <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
+                <View style={styles.filterGroup}>
                   <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.distributor}</Text>
                   <View style={styles.distributorSelector}>
                     <TouchableOpacity
                       style={styles.distributorSelectButton}
-                      onPress={() => {
-                        const dropdownKey = 'filter-distributor';
-                        setOpenDropdowns(prev => ({
-                          ...prev,
-                          [dropdownKey]: !prev[dropdownKey]
-                        }));
-                      }}
+                      onPress={(e) => toggleDropdown('filter-distributor', e)}
                     >
                       <Text style={styles.distributorSelectButtonText}>
                         {openActivitiesFilters.distributor === '__NO_DISTRIBUTOR__' 
@@ -1629,50 +1753,45 @@ const App = () => {
                           : openActivitiesFilters.distributor || t.all}
                       </Text>
                       <Text style={styles.distributorSelectArrow}>
-                        {openDropdowns['filter-distributor'] ? '▲' : '▼'}
+                        {isDropdownOpen('filter-distributor') ? '▲' : '▼'}
                       </Text>
                     </TouchableOpacity>
-                    {openDropdowns['filter-distributor'] && (
-                      <View style={styles.distributorDropdown}>
-                        <ScrollView 
-                          style={styles.distributorDropdownScroll}
-                          nestedScrollEnabled={true}
+                    {renderAnchoredDropdown('filter-distributor', () => (
+                      <>
+                        <TouchableOpacity
+                          style={styles.distributorOption}
+                          onPress={() => {
+                            setOpenActivitiesFilters(prev => ({ ...prev, distributor: '' }));
+                            closeAllDropdowns();
+                          }}
                         >
+                          <Text style={styles.distributorOptionText}>{t.all}</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.distributorOption}
+                          onPress={() => {
+                            setOpenActivitiesFilters(prev => ({ ...prev, distributor: '__NO_DISTRIBUTOR__' }));
+                            closeAllDropdowns();
+                          }}
+                        >
+                          <Text style={styles.distributorOptionText}>{t.noDistributor}</Text>
+                        </TouchableOpacity>
+                        {distributors.map(distributor => (
                           <TouchableOpacity
+                            key={distributor.id}
                             style={styles.distributorOption}
                             onPress={() => {
-                              setOpenActivitiesFilters(prev => ({ ...prev, distributor: '' }));
-                              setOpenDropdowns(prev => ({ ...prev, 'filter-distributor': false }));
+                              setOpenActivitiesFilters(prev => ({ ...prev, distributor: distributor.name }));
+                              closeAllDropdowns();
                             }}
                           >
-                            <Text style={styles.distributorOptionText}>{t.all}</Text>
+                            <Text style={styles.distributorOptionText}>
+                              {distributor.name} ({distributor.phone})
+                            </Text>
                           </TouchableOpacity>
-                          <TouchableOpacity
-                            style={styles.distributorOption}
-                            onPress={() => {
-                              setOpenActivitiesFilters(prev => ({ ...prev, distributor: '__NO_DISTRIBUTOR__' }));
-                              setOpenDropdowns(prev => ({ ...prev, 'filter-distributor': false }));
-                            }}
-                          >
-                            <Text style={styles.distributorOptionText}>{t.noDistributor}</Text>
-                          </TouchableOpacity>
-                          {distributors.map(distributor => (
-                            <TouchableOpacity
-                              key={distributor.id}
-                              style={styles.distributorOption}
-                              onPress={() => {
-                                setOpenActivitiesFilters(prev => ({ ...prev, distributor: distributor.name }));
-                                setOpenDropdowns(prev => ({ ...prev, 'filter-distributor': false }));
-                              }}
-                            >
-                              <Text style={styles.distributorOptionText}>
-                                {distributor.name} ({distributor.phone})
-                              </Text>
-                            </TouchableOpacity>
-                          ))}
-                        </ScrollView>
-                      </View>
-                    )}
+                        ))}
+                      </>
+                    ))}
                   </View>
                 </View>
                 <View style={styles.filterGroup}>
@@ -1717,19 +1836,13 @@ const App = () => {
                   </View>
                 </View>
               </View>
-              <View style={[styles.filterRow, isRTL && styles.filterRowRTL, { zIndex: 8888888 }]}>
-                <View style={[styles.filterGroup, { zIndex: 8888888 }]}>
+              <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
+                <View style={styles.filterGroup}>
                   <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.season}</Text>
                   <View style={styles.distributorSelector}>
                     <TouchableOpacity
                       style={styles.distributorSelectButton}
-                      onPress={() => {
-                        const dropdownKey = 'filter-season';
-                        setOpenDropdowns(prev => ({
-                          ...prev,
-                          [dropdownKey]: !prev[dropdownKey]
-                        }));
-                      }}
+                      onPress={(e) => toggleDropdown('filter-season', e)}
                     >
                       <Text style={styles.distributorSelectButtonText}>
                         {openActivitiesFilters.season === '__NO_SEASON__'
@@ -1739,51 +1852,46 @@ const App = () => {
                             : t.all}
                       </Text>
                       <Text style={styles.distributorSelectArrow}>
-                        {openDropdowns['filter-season'] ? '▲' : '▼'}
+                        {isDropdownOpen('filter-season') ? '▲' : '▼'}
                       </Text>
                     </TouchableOpacity>
-                    {openDropdowns['filter-season'] && (
-                      <View style={styles.distributorDropdown}>
-                        <ScrollView
-                          style={styles.distributorDropdownScroll}
-                          nestedScrollEnabled={true}
+                    {renderAnchoredDropdown('filter-season', () => (
+                      <>
+                        <TouchableOpacity
+                          style={styles.distributorOption}
+                          onPress={() => {
+                            setOpenActivitiesFilters(prev => ({ ...prev, season: '' }));
+                            closeAllDropdowns();
+                          }}
                         >
+                          <Text style={styles.distributorOptionText}>{t.all}</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.distributorOption}
+                          onPress={() => {
+                            setOpenActivitiesFilters(prev => ({ ...prev, season: '__NO_SEASON__' }));
+                            closeAllDropdowns();
+                          }}
+                        >
+                          <Text style={styles.distributorOptionText}>{t.noSeasonAssigned}</Text>
+                        </TouchableOpacity>
+                        {seasons.map(season => (
                           <TouchableOpacity
+                            key={season._id}
                             style={styles.distributorOption}
                             onPress={() => {
-                              setOpenActivitiesFilters(prev => ({ ...prev, season: '' }));
-                              setOpenDropdowns(prev => ({ ...prev, 'filter-season': false }));
+                              setOpenActivitiesFilters(prev => ({ ...prev, season: String(season._id) }));
+                              closeAllDropdowns();
                             }}
                           >
-                            <Text style={styles.distributorOptionText}>{t.all}</Text>
+                            <Text style={styles.distributorOptionText}>{season.name}</Text>
                           </TouchableOpacity>
-                          <TouchableOpacity
-                            style={styles.distributorOption}
-                            onPress={() => {
-                              setOpenActivitiesFilters(prev => ({ ...prev, season: '__NO_SEASON__' }));
-                              setOpenDropdowns(prev => ({ ...prev, 'filter-season': false }));
-                            }}
-                          >
-                            <Text style={styles.distributorOptionText}>{t.noSeasonAssigned}</Text>
-                          </TouchableOpacity>
-                          {seasons.map(season => (
-                            <TouchableOpacity
-                              key={season._id}
-                              style={styles.distributorOption}
-                              onPress={() => {
-                                setOpenActivitiesFilters(prev => ({ ...prev, season: String(season._id) }));
-                                setOpenDropdowns(prev => ({ ...prev, 'filter-season': false }));
-                              }}
-                            >
-                              <Text style={styles.distributorOptionText}>{season.name}</Text>
-                            </TouchableOpacity>
-                          ))}
-                        </ScrollView>
-                      </View>
-                    )}
+                        ))}
+                      </>
+                    ))}
                   </View>
                 </View>
-                <View style={[styles.filterGroup, { zIndex: 1 }]}>
+                <View style={styles.filterGroup}>
                   <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.activityName}</Text>
                   <TextInput
                     style={[styles.filterInput, isRTL && styles.filterInputRTL]}
@@ -1792,6 +1900,34 @@ const App = () => {
                     placeholder={t.searchActivityName}
                     textAlign={isRTL ? 'right' : 'left'}
                   />
+                </View>
+              </View>
+              <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
+                <View style={styles.filterGroup}>
+                  <Text style={[styles.filterLabel, isRTL && styles.filterLabelRTL]}>{t.kidsAgeRange}</Text>
+                  <View style={[styles.ageRangeContainer, isRTL && styles.ageRangeContainerRTL]}>
+                    <TextInput
+                      style={[styles.filterInput, { flex: 1, marginRight: isRTL ? 0 : 8, marginLeft: isRTL ? 8 : 0 }]}
+                      value={openActivitiesFilters.kidsMinAge}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({ ...prev, kidsMinAge: text.replace(/\D/g, '') }))
+                      }
+                      placeholder={t.minAge}
+                      keyboardType="numeric"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                    <Text style={styles.ageRangeSeparator}>{isRTL ? 'إلى' : 'to'}</Text>
+                    <TextInput
+                      style={[styles.filterInput, { flex: 1, marginLeft: isRTL ? 0 : 8, marginRight: isRTL ? 8 : 0 }]}
+                      value={openActivitiesFilters.kidsMaxAge}
+                      onChangeText={(text) =>
+                        setOpenActivitiesFilters(prev => ({ ...prev, kidsMaxAge: text.replace(/\D/g, '') }))
+                      }
+                      placeholder={t.maxAge}
+                      keyboardType="numeric"
+                      textAlign={isRTL ? 'right' : 'left'}
+                    />
+                  </View>
                 </View>
               </View>
               <View style={[styles.filterRow, isRTL && styles.filterRowRTL]}>
@@ -1888,10 +2024,6 @@ const App = () => {
           )}
         </View>
 
-        <ScrollView 
-          style={styles.scrollView}
-          onScrollBeginDrag={() => setOpenDropdowns({})}
-        >
           <View style={[styles.table, isRTL && styles.tableRTL]}>
             <View style={[styles.tableHeader, isRTL && styles.tableHeaderRTL]}>
               <View style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, checkboxHeaderCellStyle]}>
@@ -1944,16 +2076,13 @@ const App = () => {
                 
                 const distDropdownKey = `${activity.personId}-${activity.activityIndex}`;
                 const seasonDropdownKey = `season-${activity.personId}-${activity.activityIndex}`;
-                const isDistOpen = openDropdowns[distDropdownKey];
-                const isSeasonOpen = openDropdowns[seasonDropdownKey];
-                const isDropdownOpen = isDistOpen || isSeasonOpen;
                 const rowKey =
                   hasNoActivity || activity.activityIndex === undefined || activity.activityIndex === null
                     ? null
                     : openActivityRowKey(activity.personId, activity.activityIndex);
                 const isActivityRowSelected = rowKey != null && selectedKeySet.has(rowKey);
                 return (
-                  <View key={`${activity.personId}-${activity.date}-${group.key}-${index}`} style={[styles.tableRow, isRTL && styles.tableRowRTL, { zIndex: isDropdownOpen ? 99999999 : 1 }]}>
+                  <View key={`${activity.personId}-${activity.date}-${group.key}-${index}`} style={[styles.tableRow, isRTL && styles.tableRowRTL]}>
                     <View style={[styles.tableCell, checkboxHeaderCellStyle]}>
                       <TouchableOpacity
                         style={[
@@ -1985,129 +2114,101 @@ const App = () => {
                     <Text style={[styles.tableCell, styles.tableCellText, isRTL && styles.tableCellRTL, { flex: 2 }]}>
                       {activity.description || '-'}
                     </Text>
-                  <View style={[styles.tableCell, { flex: 1.4, zIndex: isSeasonOpen ? 99999999 : 1 }]}>
+                  <View style={[styles.tableCell, { flex: 1.4 }]}>
                     {activity.activityStatus !== 'none' ? (
-                      <View style={[styles.distributorSelector, { zIndex: isSeasonOpen ? 99999999 : 1 }]}>
+                      <View style={styles.distributorSelector}>
                         <TouchableOpacity
                           style={styles.distributorSelectButton}
                           onPress={(e) => {
                             e.stopPropagation();
-                            setOpenDropdowns(prev => ({
-                              ...prev,
-                              [seasonDropdownKey]: !prev[seasonDropdownKey]
-                            }));
+                            toggleDropdown(seasonDropdownKey, e);
                           }}
                         >
                           <Text style={styles.distributorSelectButtonText} numberOfLines={1}>
                             {activity.seasonName || t.noSeasonAssigned}
                           </Text>
                           <Text style={styles.distributorSelectArrow}>
-                            {openDropdowns[seasonDropdownKey] ? '▲' : '▼'}
+                            {isDropdownOpen(seasonDropdownKey) ? '▲' : '▼'}
                           </Text>
                         </TouchableOpacity>
-                        {openDropdowns[seasonDropdownKey] && (
-                          <View style={[styles.distributorDropdown, { zIndex: 99999999 }]}>
-                            <ScrollView 
-                              style={styles.distributorDropdownScroll}
-                              nestedScrollEnabled={true}
+                        {renderAnchoredDropdown(seasonDropdownKey, () => (
+                          <>
+                            <TouchableOpacity
+                              style={styles.distributorOption}
+                              onPress={(e) => {
+                                e.stopPropagation();
+                                updateActivitySeason(activity.personId, activity.activityIndex, null);
+                                closeAllDropdowns();
+                              }}
                             >
+                              <Text style={styles.distributorOptionText}>{t.noSeasonAssigned}</Text>
+                            </TouchableOpacity>
+                            {seasons.map(season => (
                               <TouchableOpacity
+                                key={season._id}
                                 style={styles.distributorOption}
                                 onPress={(e) => {
                                   e.stopPropagation();
-                                  updateActivitySeason(activity.personId, activity.activityIndex, null);
-                                  setOpenDropdowns(prev => ({
-                                    ...prev,
-                                    [seasonDropdownKey]: false
-                                  }));
+                                  updateActivitySeason(activity.personId, activity.activityIndex, season._id);
+                                  closeAllDropdowns();
                                 }}
                               >
-                                <Text style={styles.distributorOptionText}>{t.noSeasonAssigned}</Text>
+                                <Text style={styles.distributorOptionText}>{season.name}</Text>
                               </TouchableOpacity>
-                              {seasons.map(season => (
-                                <TouchableOpacity
-                                  key={season._id}
-                                  style={styles.distributorOption}
-                                  onPress={(e) => {
-                                    e.stopPropagation();
-                                    updateActivitySeason(activity.personId, activity.activityIndex, season._id);
-                                    setOpenDropdowns(prev => ({
-                                      ...prev,
-                                      [seasonDropdownKey]: false
-                                    }));
-                                  }}
-                                >
-                                  <Text style={styles.distributorOptionText}>{season.name}</Text>
-                                </TouchableOpacity>
-                              ))}
-                            </ScrollView>
-                          </View>
-                        )}
+                            ))}
+                          </>
+                        ))}
                       </View>
                     ) : (
                       <Text style={[styles.tableCellText, isRTL && styles.tableCellRTL]}>-</Text>
                     )}
                   </View>
-                  <View style={[styles.tableCell, { flex: 2, zIndex: isDistOpen ? 99999999 : 1 }]}>
+                  <View style={[styles.tableCell, { flex: 2 }]}>
                     {activity.activityStatus !== 'none' ? (
-                      <View style={[styles.distributorSelector, { zIndex: isDistOpen ? 99999999 : 1 }]}>
+                      <View style={styles.distributorSelector}>
                         <TouchableOpacity
                           style={styles.distributorSelectButton}
                           onPress={(e) => {
                             e.stopPropagation();
-                            setOpenDropdowns(prev => ({
-                              ...prev,
-                              [distDropdownKey]: !prev[distDropdownKey]
-                            }));
+                            toggleDropdown(distDropdownKey, e);
                           }}
                         >
                           <Text style={styles.distributorSelectButtonText}>
                             {activity.distributor || t.selectDistributor}
                           </Text>
                           <Text style={styles.distributorSelectArrow}>
-                            {openDropdowns[distDropdownKey] ? '▲' : '▼'}
+                            {isDropdownOpen(distDropdownKey) ? '▲' : '▼'}
                           </Text>
                         </TouchableOpacity>
-                        {openDropdowns[distDropdownKey] && (
-                          <View style={[styles.distributorDropdown, { zIndex: 99999999 }]}>
-                            <ScrollView 
-                              style={styles.distributorDropdownScroll}
-                              nestedScrollEnabled={true}
+                        {renderAnchoredDropdown(distDropdownKey, () => (
+                          <>
+                            <TouchableOpacity
+                              style={styles.distributorOption}
+                              onPress={(e) => {
+                                e.stopPropagation();
+                                updateActivityDistributor(activity.personId, activity.activityIndex, '');
+                                closeAllDropdowns();
+                              }}
                             >
+                              <Text style={styles.distributorOptionText}>{t.selectDistributor}</Text>
+                            </TouchableOpacity>
+                            {distributors.map(distributor => (
                               <TouchableOpacity
+                                key={distributor.id}
                                 style={styles.distributorOption}
                                 onPress={(e) => {
                                   e.stopPropagation();
-                                  updateActivityDistributor(activity.personId, activity.activityIndex, '');
-                                  setOpenDropdowns(prev => ({
-                                    ...prev,
-                                    [distDropdownKey]: false
-                                  }));
+                                  updateActivityDistributor(activity.personId, activity.activityIndex, distributor.name);
+                                  closeAllDropdowns();
                                 }}
                               >
-                                <Text style={styles.distributorOptionText}>{t.selectDistributor}</Text>
+                                <Text style={styles.distributorOptionText}>
+                                  {distributor.name} ({distributor.phone})
+                                </Text>
                               </TouchableOpacity>
-                              {distributors.map(distributor => (
-                                <TouchableOpacity
-                                  key={distributor.id}
-                                  style={styles.distributorOption}
-                                  onPress={(e) => {
-                                    e.stopPropagation();
-                                    updateActivityDistributor(activity.personId, activity.activityIndex, distributor.name);
-                                    setOpenDropdowns(prev => ({
-                                      ...prev,
-                                      [distDropdownKey]: false
-                                    }));
-                                  }}
-                                >
-                                  <Text style={styles.distributorOptionText}>
-                                    {distributor.name} ({distributor.phone})
-                                  </Text>
-                                </TouchableOpacity>
-                              ))}
-                            </ScrollView>
-                          </View>
-                        )}
+                            ))}
+                          </>
+                        ))}
                       </View>
                     ) : (
                       <Text style={[styles.tableCellText, isRTL && styles.tableCellRTL]}>-</Text>
@@ -2356,6 +2457,7 @@ const App = () => {
 
       {renderBulkAddActivityModal()}
 
+      <ScrollView style={styles.scrollView} onScrollBeginDrag={handleScrollCloseDropdowns}>
       {/* Search Bar */}
       <View style={styles.searchContainer}>
         <View style={[styles.searchFieldWrapper, isRTL && styles.searchFieldWrapperRTL]}>
@@ -2655,7 +2757,6 @@ const App = () => {
         )}
       </View>
 
-      <ScrollView style={styles.scrollView}>
         <View style={[styles.table, isRTL && styles.tableRTL]}>
           <View style={[styles.tableHeader, isRTL && styles.tableHeaderRTL]}>
             <View style={[styles.tableCell, styles.headerCell, isRTL && styles.headerCellRTL, { width: 50, flex: 0, minWidth: 50, maxWidth: 50, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 8 }]}>
@@ -3141,39 +3242,39 @@ const App = () => {
 
             <ScrollView style={styles.form}>
               {/* Add New Activity */}
-              <View style={styles.formGroup}>
+              <View style={[styles.formGroup, styles.bulkAddDistributorFormGroup]}>
                 <Text style={styles.label}>{t.selectSeason}</Text>
-                <TouchableOpacity
-                  style={styles.distributorSelectButton}
-                  onPress={() => setActivitySeasonDropdownOpen(!activitySeasonDropdownOpen)}
-                >
-                  <Text style={styles.distributorSelectButtonText}>
-                    {newActivitySeasonId && seasons.find(s => String(s._id) === String(newActivitySeasonId))
-                      ? seasons.find(s => String(s._id) === String(newActivitySeasonId)).name
-                      : t.selectSeason}
-                  </Text>
-                  <Text style={styles.distributorSelectArrow}>
-                    {activitySeasonDropdownOpen ? '▲' : '▼'}
-                  </Text>
-                </TouchableOpacity>
-                {activitySeasonDropdownOpen && (
-                  <View style={[styles.distributorDropdown, { marginBottom: 8 }]}>
-                    <ScrollView style={styles.distributorDropdownScroll} nestedScrollEnabled={true}>
+                <View style={styles.distributorSelector}>
+                  <TouchableOpacity
+                    style={styles.distributorSelectButton}
+                    onPress={(e) => toggleDropdown('activity-season', e)}
+                  >
+                    <Text style={styles.distributorSelectButtonText}>
+                      {newActivitySeasonId && seasons.find(s => String(s._id) === String(newActivitySeasonId))
+                        ? seasons.find(s => String(s._id) === String(newActivitySeasonId)).name
+                        : t.selectSeason}
+                    </Text>
+                    <Text style={styles.distributorSelectArrow}>
+                      {isDropdownOpen('activity-season') ? '▲' : '▼'}
+                    </Text>
+                  </TouchableOpacity>
+                  {renderAnchoredDropdown('activity-season', () => (
+                    <>
                       {seasons.map(season => (
                         <TouchableOpacity
                           key={season._id}
                           style={styles.distributorOption}
                           onPress={() => {
                             setNewActivitySeasonId(season._id);
-                            setActivitySeasonDropdownOpen(false);
+                            closeAllDropdowns();
                           }}
                         >
                           <Text style={styles.distributorOptionText}>{season.name}</Text>
                         </TouchableOpacity>
                       ))}
-                    </ScrollView>
-                  </View>
-                )}
+                    </>
+                  ))}
+                </View>
               </View>
               <View style={styles.formGroup}>
                 <Text style={styles.label}>{t.addNewActivity}</Text>
@@ -3273,6 +3374,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f5f5',
     paddingTop: 40,
+    overflow: 'hidden',
   },
   containerRTL: {
     direction: 'rtl',
@@ -3293,6 +3395,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 4,
     elevation: 3,
+    position: 'sticky',
+    top: 0,
+    zIndex: 1000,
   },
   headerRTL: {
     flexDirection: 'row-reverse',
@@ -3331,6 +3436,7 @@ const styles = StyleSheet.create({
   },
   scrollView: {
     flex: 1,
+    minHeight: 0,
   },
   table: {
     backgroundColor: '#fff',
@@ -4218,7 +4324,6 @@ const styles = StyleSheet.create({
   distributorSelector: {
     width: '100%',
     position: 'relative',
-    zIndex: 9999999,
   },
   distributorSelectButton: {
     flexDirection: 'row',
@@ -4253,13 +4358,38 @@ const styles = StyleSheet.create({
     borderRadius: 5,
     marginTop: 4,
     maxHeight: 300,
-    zIndex: 9999999,
+    zIndex: 1000,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 10,
-    elevation: 9999,
+    elevation: 10,
     overflow: 'hidden',
+  },
+  /** Portal dropdown menu — fixed position, top/left set inline (no top: 100%). */
+  distributorDropdownMenu: {
+    position: 'fixed',
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 5,
+    maxHeight: 300,
+    zIndex: 100001,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 10,
+    overflow: 'hidden',
+  },
+  dropdownBackdrop: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 100000,
+    backgroundColor: 'transparent',
   },
   /** Wrapper for distributor in bulk-add modal so dropdown is not clipped and stacks above buttons */
   bulkAddDistributorFormGroup: {
